@@ -38,7 +38,7 @@ function fmtCountdown(iso) {
   if (ms <= 0) return "已重置";
   const s = Math.floor(ms / 1000);
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
-  if (d > 0) return `${d}天${h}h`;
+  if (d > 0) return `${d}d${h}h`;
   if (h > 0) return `${h}h${m}m`;
   return `${m}m`;
 }
@@ -115,12 +115,10 @@ function statusBadge(status) {
 function qbar(key, win) {
   const q = key.quota && key.quota[win];
   const pct = q ? q.percent : 0;
-  const st = q ? q.status : "ok";
-  const limited = st === "rate-limited";
   return `<div class="qbar-row">
     <span class="qbar-label">${WINDOW_LABEL[win]}</span>
-    <div class="qbar-track"><div class="qbar-fill ${win}" style="width:${pct}%"></div></div>
-    <span class="qbar-reset">${pct}%${limited ? " · 限" : ""} · 重置 ${fmtCountdown(q && q.resetsAt)}</span>
+    <div class="qbar-track"><div class="qbar-fill ${win}" style="width:${Math.min(100, pct)}%"></div></div>
+    <span class="qbar-reset">${pct}% · 重置 ${fmtCountdown(q && q.resetsAt)}</span>
   </div>`;
 }
 
