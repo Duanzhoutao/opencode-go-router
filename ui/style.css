@@ -352,7 +352,7 @@ main {
 .tag.bind, .tag.migrate, .tag.enroll, .tag.recover, .tag.reactivate { background: rgba(45,154,95,0.14); color: var(--ok); }
 .tag.rate-limited, .tag.cooldown, .tag.failover, .tag.cache-hit { background: rgba(212,138,30,0.14); color: var(--warn); }
 .tag.quarantine, .tag.exhausted, .tag.same-workspace-alert, .tag.invalid { background: rgba(201,80,58,0.14); color: var(--danger); }
-.tag.delete, .tag.edit, .tag.config, .tag.upstream-5xx { background: rgba(154,143,128,0.16); color: var(--ink-soft); }
+.tag.delete, .tag.edit, .tag.config, .tag.upstream-5xx, .tag.refresh { background: rgba(154,143,128,0.16); color: var(--ink-soft); }
 
 /* ---- 设置 ---- */
 .kv { display: grid; grid-template-columns: 170px 1fr; gap: 8px 14px; margin: 0; font-size: 13px; }

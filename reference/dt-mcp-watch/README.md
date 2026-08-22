@@ -17,7 +17,7 @@ desktop-touch 是桌面控制 MCP（代码在 `~/.desktop-touch-mcp/releases/v1.
 
 `watch-zcode.js` 由计划任务 `DT-MCP-Shared-HTTP`（登录触发，`start-watch.vbs` 隐藏拉起）常驻：每 5s 轮询 `ZCode.exe`，在则保引擎、消失 60s 停引擎，watcher 永不退出。
 
-- 缺点：watcher 是**永久后台常驻进程**（~55MB）；且它引用了当时借住在某目录（该目录 2026-08-19 已删除，node 统一迁到作者机器 `D:\APP\NodeJS\node.exe`，此后为标准 node）的运行时；计划任务登录即跑，与 ZCode 是否使用无关。
+- 缺点：watcher 是**永久后台常驻进程**（~55MB）；且它引用了当时借住在某目录（该目录 2026-08-19 已删除，node 其后统一迁到标准安装位置）的运行时；计划任务登录即跑，与 ZCode 是否使用无关。
 - 该计划任务已删除；`watch-zcode.js`/`start-watch.vbs` 保留作手动回退参考（已迁标准 node）。
 
 ### v2：stdio dt-owner 看守（每个会话一个进程）—— 被否，本文档记录原因
@@ -166,5 +166,5 @@ Start-Process node -ArgumentList "$HOME\tools\dt-mcp-watch\dt-guard.cjs" -Window
 - **回退到 v1（计划任务 watcher）**：恢复 config 的 `hooks` 块删除、重建计划任务（动作 `wscript.exe "$HOME\tools\dt-mcp-watch\start-watch.vbs"`、登录触发）。
 - **钩子没触发**（日志无新行）：先查 `hooks.enabled: true` 是否在；`SessionStart` 拼写；ZCode 日志里 hook 执行记录（fired/timed out/failed）。
 - **钩子报错/阻塞**：dt-guard 只输出空 + exit 0，不应阻塞；若超时先看 `timeoutMs` 是否误写成秒。
-- **引擎起不来**：手动跑 `node dt-guard.cjs` 看日志；确认 `node.exe` 在 PATH（作者机器为 `D:\APP\NodeJS\node.exe`）、引擎 cwd 正确（引擎按相对路径解析 assets）。
+- **引擎起不来**：手动跑 `node dt-guard.cjs` 看日志；确认 `node.exe` 在 PATH（标准安装位置）、引擎 cwd 正确（引擎按相对路径解析 assets）。
 - **锁卡死**：`guard.lock` 里 pid 已死仍残留 → 直接删文件即可（陈旧锁本来就会被接管，删了更干净）。

@@ -134,6 +134,7 @@ curl -s http://127.0.0.1:8788/v1/chat/completions \
 | `PATCH` | `/api/keys/{id}` | 改名 / 停用 / 启用 |
 | `DELETE` | `/api/keys/{id}` | 删除 |
 | `POST` | `/api/keys/{id}/refresh` | 强制刷新用量 |
+| `POST` | `/api/keys/refresh-all` | 批量刷新全部可用 Key 用量（跳过隔离/失效） |
 | `POST` | `/api/keys/{id}/reactivate` | 手动复活冷却 Key |
 | `POST` | `/api/keys/{id}/quarantine` | 手动隔离 |
 | `GET` | `/api/sessions` | 会话绑定表 |

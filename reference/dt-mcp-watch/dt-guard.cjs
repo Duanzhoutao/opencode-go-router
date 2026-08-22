@@ -29,10 +29,10 @@ const { spawn, execSync } = require("node:child_process");
 const PORT = 23847;
 const HEALTH_URL = `http://127.0.0.1:${PORT}/health`;
 const NODE_EXE = process.execPath; // 谁跑我，我就用谁 spawn
-const ENGINE_ENTRY = "C:/Users/duanz/.desktop-touch-mcp/releases/v1.14.3/dist/index.js";
-// 引擎按相对路径解析 assets/，cwd 必须设到包目录
-const ENGINE_CWD = "C:/Users/duanz/AppData/Local/npm-cache/_npx/7ef18fc3781728a1/node_modules/@harusame64/desktop-touch-mcp";
 const HOME = os.homedir();
+const ENGINE_ENTRY = path.join(HOME, ".desktop-touch-mcp", "releases", "v1.14.3", "dist", "index.js");
+// 引擎按相对路径解析 assets/，cwd 必须设到包目录
+const ENGINE_CWD = path.join(HOME, "AppData", "Local", "npm-cache", "_npx", "7ef18fc3781728a1", "node_modules", "@harusame64", "desktop-touch-mcp");
 const LOCK_PATH = path.join(HOME, ".desktop-touch-mcp", "guard.lock");
 const LOG_PATH = path.join(HOME, ".desktop-touch-mcp", "dt-guard.log");
 const IDLE_EXIT_S = Number(process.env.DT_GUARD_IDLE_S) || 60;

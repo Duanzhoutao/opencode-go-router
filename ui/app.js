@@ -232,7 +232,7 @@ function renderSessions() {
     : `<tr><td colspan="5" style="color:var(--muted)">暂无会话绑定——ZCode 发起请求后会自动绑定到 Key。</td></tr>`;
 }
 
-const EV_TYPES = ["bind", "migrate", "enroll", "cooldown", "rate-limited", "failover", "quarantine", "recover", "reactivate", "invalid", "exhausted", "cache-hit", "same-workspace-alert", "upstream-5xx", "delete", "edit", "config"];
+const EV_TYPES = ["bind", "migrate", "enroll", "cooldown", "rate-limited", "failover", "quarantine", "recover", "reactivate", "invalid", "exhausted", "cache-hit", "same-workspace-alert", "upstream-5xx", "delete", "edit", "config", "refresh"];
 
 function renderEvents() {
   const sel = $("#evType");
@@ -317,6 +317,18 @@ async function actRefresh(id) {
   try {
     const r = await api(`/api/keys/${id}/refresh`, { method: "POST" });
     toast(`已刷新 ${r.key.label}：weekly ${r.key.quota.weekly.percent}%`);
+  } catch (e) { toast("刷新失败：" + e.message, true); }
+  refreshAll(true);
+}
+
+// 右上角「立即刷新」：批量重查全部可用 Key 的 /usage（BUG-009 修复；旧实现只重拉缓存视图）
+async function actRefreshAll() {
+  try {
+    const r = await api("/api/keys/refresh-all", { method: "POST" });
+    const list = r.refreshed || [];
+    const okN = list.filter((x) => x.ok).length;
+    const badN = list.length - okN;
+    toast(badN ? `已刷新 ${okN} 个 Key，${badN} 个失败` : `已刷新全部 ${okN} 个 Key`);
   } catch (e) { toast("刷新失败：" + e.message, true); }
   refreshAll(true);
 }
@@ -421,7 +433,7 @@ document.addEventListener("click", async (e) => {
 
 $("#addKeyForm").addEventListener("submit", addKey);
 $("#configForm").addEventListener("submit", saveConfig);
-$("#btnRefresh").addEventListener("click", () => refreshAll(false));
+$("#btnRefresh").addEventListener("click", actRefreshAll);
 $("#autoRefresh").addEventListener("change", setupPolling);
 $("#refreshInterval").addEventListener("change", setupPolling);
 $("#toggleNewKey").addEventListener("click", () => {

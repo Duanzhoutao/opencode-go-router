@@ -646,6 +646,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && p === "/api/config") return json(res, 200, { config: { ...state.config, localToken: state.config.localToken ? "(set)" : null } });
 
   if (req.method === "POST" && p === "/api/keys") return handleEnroll(req, res);
+  if (req.method === "POST" && p === "/api/keys/refresh-all") return handleRefreshAll(req, res);
   if (req.method === "PATCH" && p.startsWith("/api/keys/")) return handlePatchKey(req, res, url);
   if (req.method === "DELETE" && p.startsWith("/api/keys/")) return handleDeleteKey(req, res, url);
   if (req.method === "POST" && p.startsWith("/api/keys/") && p.endsWith("/refresh")) return handleRefresh(req, res, url);
@@ -737,6 +738,33 @@ async function handleRefresh(req, res, url) {
   runStateMachine(key);
   saveState();
   return json(res, 200, { ok: true, key: redactKey(key) });
+}
+
+// 批量刷新：与后台轮询 runPoll 同语义（跳过隔离/失效），对每个可用 Key 重查 /usage 并跑状态机。
+// 前端右上角「立即刷新」调它（BUG-009：旧实现只重拉缓存视图，从不触发上游重查）。
+async function handleRefreshAll(req, res) {
+  const refreshed = [];
+  for (const key of state.keys) {
+    if (key.status === "invalid" || key.status === "quarantined") continue;
+    if (MOCK) {
+      key.quota = mockUsage(Math.min(100, quotaPercent(key, "rolling") + 7), quotaPercent(key, "weekly"), quotaPercent(key, "monthly"));
+      refreshed.push({ id: key.id, ok: true });
+      continue;
+    }
+    const v = await fetchUsage(key.key);
+    if (!v.ok) {
+      if (v.code === 401) quarantine(key, "auth_invalid");
+      refreshed.push({ id: key.id, ok: false, code: v.code === 401 ? 401 : "usage", msg: v.msg || String(v.code) });
+      continue;
+    }
+    key.quota = toQuota(v.usage);
+    runStateMachine(key);
+    refreshed.push({ id: key.id, ok: true });
+  }
+  saveState();
+  const okN = refreshed.filter((x) => x.ok).length;
+  addEvent("refresh", null, `refresh-all: ok=${okN} failed=${refreshed.length - okN}`);
+  return json(res, 200, { ok: true, refreshed });
 }
 
 async function handleReactivate(req, res, url) {
