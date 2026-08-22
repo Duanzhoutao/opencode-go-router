@@ -881,10 +881,10 @@ function agentGuidePrompt() {
   return [
     `你是我的配置助手。本机正在通过管理界面 ${url} 使用 OpenCode Go 多 Key 网关，OpenAI 兼容端点 ${url}/v1（chat/completions、models）。`,
     `请把我的编程助手（ZCode / Claude Code / 其他 OpenAI 兼容客户端）接入该网关：`,
-    `1. 读以下材料理解本项目的运行方式：开源仓库 https://github.com/Duanzhoutao/opencode-go-router 的 README 与 docs/（入口 docs/README.md：client-integration.md 客户端接入、guard.md 跟随启动钩子、architecture.md 多 Key 路由与缓存粘性、configuration.md 配置、faq.md 排错）；本机源码 ${dir}（README.md、docs/、go-gateway.cjs、go-guard.cjs）。`,
+    `1. 读以下材料理解本项目的运行方式：开源仓库 GitHub https://github.com/Duanzhoutao/opencode-go-router（备用镜像 GitCode https://gitcode.com/zhoutao-2026/opencode-go-router）的 README 与 docs/（入口 docs/README.md：client-integration.md 客户端接入、guard.md 跟随启动钩子、architecture.md 多 Key 路由与缓存粘性、configuration.md 配置、faq.md 排错）；本机源码 ${dir}（README.md、docs/、go-gateway.cjs、go-guard.cjs）。`,
     `2. 把我客户端的模型 baseURL 改为 ${url}/v1，apiKey 用占位符（如 sk-local-gateway）；改前先备份配置文件，保留原 provider（设为 disabled）作逃生门。`,
     `3. 评估我的客户端能否同时启用跟随启动（如 SessionStart 钩子机制）：能则一并配置并验证，不能则说明原因，不硬做。`,
-    `边界：只动模型接入相关配置；修改任何文件前先列出改动征求我同意；事实先检测再下结论，不猜。`,
+    `边界：只动模型接入相关配置；动手前把你的完整执行计划（改哪些文件与内容、配置位置的判断依据、是否启用跟随启动、备份与回退方式）一次列清给我确认——只问这一次，确认后连续执行到完成，中途不再逐步征求；事实先检测再下结论，不猜。`,
     `完成后汇报：改了哪些文件、如何回退、验证结果（经网关发一条测试请求）。`,
   ].join("\n");
 }

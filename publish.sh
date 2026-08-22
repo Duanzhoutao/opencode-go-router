@@ -83,7 +83,13 @@ git -C "$PUB" fetch origin main --quiet
 git -C "$PUB" push --force-with-lease origin main
 
 git -C "$PUB" checkout -q -B gitcode-mirror main
-grep -rl -F -e "Duanzhoutao/opencode-go-router" --exclude-dir=.git --exclude=publish.sh "$PUB" 2>/dev/null | while read -r f; do
+# 变体替换排除 go-gateway.cjs：其 agentGuidePrompt 同时含 GitHub 主仓库 + GitCode 备用镜像两个链接，
+# 跨平台保持一致（备用镜像不随发布平台切换），若参与 sed 会把 GitHub 链接也换成 GitCode 造成重复。
+# 用文件名尾缀判断（Windows 下 grep -r 输出路径分隔符与 $PUB 可能不一致，禁用路径精确比对）。
+grep -rl -F -e "Duanzhoutao/opencode-go-router" --exclude-dir=.git --exclude=publish.sh "$PUB" 2>/dev/null \
+  | tr '\\' '/' | tr -d '\r' \
+  | while read -r f; do
+  case "$f" in *go-gateway.cjs) continue ;; esac
   sed -i -f "$SEDF" "$f"
 done
 rm -f "$SEDF"

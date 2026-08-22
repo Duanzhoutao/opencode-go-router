@@ -135,7 +135,7 @@ function qbar(key, win) {
   return `<div class="qbar-row">
     <span class="qbar-label">${WINDOW_LABEL[win]}</span>
     <div class="qbar-track"><div class="qbar-fill ${cls}" style="width:${limited ? 100 : Math.min(100, pct)}%"></div></div>
-    <span class="qbar-reset">${pct}% · 重置 ${fmtCountdown(q && q.resetsAt)}</span>
+    <span class="qbar-reset"><span class="qr-pct">${pct}%</span><span class="qr-verb">· 重置</span><span class="qr-time">${fmtCountdown(q && q.resetsAt)}</span></span>
   </div>`;
 }
 

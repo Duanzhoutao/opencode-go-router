@@ -297,7 +297,13 @@ main {
 .qbar-fill.ok { background: linear-gradient(90deg, #5cc88a, var(--ok)); }
 .qbar-fill.warn { background: linear-gradient(90deg, #f0c060, var(--accent-2)); }
 .qbar-fill.over { background: linear-gradient(90deg, var(--danger-soft), var(--danger)); }
-.qbar-reset { color: var(--muted); text-align: right; font-family: var(--mono); font-size: 10.5px; white-space: nowrap; }
+.qbar-reset {
+  color: var(--muted); display: grid; grid-template-columns: 30px 34px 1fr; gap: 4px;
+  align-items: center; font-family: var(--mono); font-size: 10.5px; white-space: nowrap;
+}
+.qbar-reset .qr-pct { text-align: right; }
+.qbar-reset .qr-verb { text-align: left; }
+.qbar-reset .qr-time { text-align: left; }
 .kc-foot {
   display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap;
   color: var(--ink-soft); font-size: 12px; position: relative; z-index: 1;
