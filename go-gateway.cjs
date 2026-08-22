@@ -75,7 +75,7 @@ function defaultState() {
       pollIntervalMs: 15 * 60 * 1000, // /usage 主动轮询默认 15min
       preSwitchPct: 90,               // 预切换阈值：rolling 5h 窗口 ≥ 此值提前迁移
       preSwitchWeeklyPct: 95,         // 预切换阈值：weekly 周窗口 ≥ 此值提前迁移（与 rolling 分档，BUG-004）
-      concurrencyPerKey: 1,           // 每 Key 并发上限
+      concurrencyPerKey: 5,           // 每 Key 并发上限
       localToken: null,               // 可选本地 token：设置后转发面与控制面要求 Bearer
       stickyEnabled: true,            // x-session-id 粘性开关
     },

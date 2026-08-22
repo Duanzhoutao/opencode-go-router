@@ -49,6 +49,14 @@ function fmtTs(iso) {
   return d.toLocaleString("zh-CN", { hour12: false });
 }
 
+// token 量格式化：≥1 亿显示「亿」，≥100 万显示「M」，其余原样
+function fmtTokens(n) {
+  if (!n) return "0";
+  if (n >= 1e8) return parseFloat((n / 1e8).toFixed(n < 1e9 ? 2 : 1)) + " 亿";
+  if (n >= 1e6) return parseFloat((n / 1e6).toFixed(n < 1e7 ? 2 : 1)) + " M";
+  return String(n);
+}
+
 function shortSession(s, n = 18) {
   return s && s.length > n ? s.slice(0, n) + "…" : (s || "—");
 }
@@ -112,11 +120,22 @@ function statusBadge(status) {
 function qbar(key, win) {
   const q = key.quota && key.quota[win];
   const pct = q ? q.percent : 0;
+  const limited = q && q.status === "rate-limited";
+  const cls = limited || pct >= 100 ? "over" : pct >= 90 ? "warn" : "ok";
   return `<div class="qbar-row">
     <span class="qbar-label">${WINDOW_LABEL[win]}</span>
-    <div class="qbar-track"><div class="qbar-fill ${win}" style="width:${Math.min(100, pct)}%"></div></div>
+    <div class="qbar-track"><div class="qbar-fill ${cls}" style="width:${limited ? 100 : Math.min(100, pct)}%"></div></div>
     <span class="qbar-reset">${pct}% · 重置 ${fmtCountdown(q && q.resetsAt)}</span>
   </div>`;
+}
+
+// 同池 = 多个 Key 共享同一 workspace 额度池（轮换无效）
+function samePoolSet() {
+  const byWs = {};
+  for (const k of state.keys) if (k.workspaceId) (byWs[k.workspaceId] = byWs[k.workspaceId] || []).push(k.id);
+  const dup = new Set();
+  for (const ids of Object.values(byWs)) if (ids.length > 1) ids.forEach((i) => dup.add(i));
+  return dup;
 }
 
 function renderOverview() {
@@ -128,14 +147,11 @@ function renderOverview() {
     ["quarantined", counts.quarantined, "隔离"],
     ["invalid", counts.invalid, "失效"],
     ["requests", st ? st.totalRequests : 0, "总请求"],
-    ["cached", st ? st.totalCachedTokens : 0, "缓存 token"],
+    ["cached", fmtTokens(st ? st.totalCachedTokens : 0), "缓存 token"],
   ].map(([cls, num, lbl]) => `<div class="stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`).join("");
 
   const grid = $("#keyGrid");
-  const dup = new Set();
-  const byWs = {};
-  for (const k of state.keys) if (k.workspaceId) (byWs[k.workspaceId] = byWs[k.workspaceId] || []).push(k.id);
-  for (const ids of Object.values(byWs)) if (ids.length > 1) ids.forEach((i) => dup.add(i));
+  const dup = samePoolSet();
 
   const activeKeys = state.keys.filter((k) => k.status !== "quarantined" && k.status !== "invalid");
   grid.innerHTML = activeKeys.map((k) => {
@@ -153,11 +169,10 @@ function renderOverview() {
         </span>
       </div>
       <div class="kc-key mono">${esc(k.key)}</div>
-      <div class="kc-ws mono${same ? " dup" : ""}">${k.workspaceId ? esc(k.workspaceId) : "workspace 待发现"}</div>
       <div class="quota-bars">${qbar(k, "rolling")}${qbar(k, "weekly")}${qbar(k, "monthly")}</div>
       <div class="kc-foot">
         <span>会话请求 <b>${k.stats ? k.stats.requests : 0}</b></span>
-        <span>缓存命中 <b>${k.stats ? k.stats.cacheHits : 0}</b> (${k.stats ? k.stats.cachedTokens : 0})</span>
+        <span>缓存命中 <b>${k.stats ? k.stats.cacheHits : 0}</b> (${k.stats ? fmtTokens(k.stats.cachedTokens) : "0"})</span>
         <span title="当前粘在此 Key 上的会话">🔗 ${sess ? shortSession(sess.sessionId, 14) : "无"}</span>
       </div>
     </div>`;
@@ -170,13 +185,14 @@ function renderOverview() {
 
 function renderKeys() {
   const tb = $("#keyTable tbody");
+  const dup = samePoolSet();
   tb.innerHTML = state.keys.map((k) => `<tr>
     <td><b>${esc(k.label)}</b></td>
     <td class="mono">${esc(k.key)}</td>
     <td>${statusBadge(k.status)}</td>
-    <td class="mono">${k.workspaceId ? esc(k.workspaceId) : "—"}</td>
+    <td>${dup.has(k.id) ? '<span class="tag same-workspace-alert">同池</span>' : "—"}</td>
     <td>${k.stats ? k.stats.requests : 0}</td>
-    <td>${k.stats ? `${k.stats.cacheHits} / ${k.stats.cachedTokens}` : "0 / 0"}</td>
+    <td>${k.stats ? `${k.stats.cacheHits} / ${fmtTokens(k.stats.cachedTokens)}` : "0 / 0"}</td>
     <td>
       <button class="btn small" data-act="refresh" data-id="${esc(k.id)}">刷新</button>
       <button class="btn small" data-act="edit" data-id="${esc(k.id)}">编辑</button>
@@ -244,7 +260,7 @@ function renderSettings() {
   const c = state.config || {};
   $("#cfgPoll").value = Math.round((c.pollIntervalMs || 900000) / 60000);
   $("#cfgPre").value = c.preSwitchPct ?? 90;
-  $("#cfgConc").value = c.concurrencyPerKey ?? 1;
+  $("#cfgConc").value = c.concurrencyPerKey ?? 5;
   $("#cfgSticky").checked = c.stickyEnabled !== false;
   $("#cfgToken").value = "";
 
@@ -362,7 +378,7 @@ async function saveConfig(e) {
   const body = {
     pollIntervalMs: Math.max(5, Math.min(60, Number($("#cfgPoll").value) || 15)) * 60000,
     preSwitchPct: Number($("#cfgPre").value) || 90,
-    concurrencyPerKey: Number($("#cfgConc").value) || 1,
+    concurrencyPerKey: Number($("#cfgConc").value) || 5,
     stickyEnabled: $("#cfgSticky").checked,
   };
   const tok = $("#cfgToken").value.trim();

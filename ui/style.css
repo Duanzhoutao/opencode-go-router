@@ -277,8 +277,6 @@ main {
 .kc-actions { margin-left: auto; display: flex; gap: 4px; }
 .kc-actions .btn { padding: 3px 8px; font-size: 13px; }
 .kc-key { color: var(--ink-soft); margin-top: 4px; font-family: var(--mono); font-size: 12px; position: relative; z-index: 1; }
-.kc-ws { color: var(--muted); margin-top: 2px; font-size: 11.5px; font-family: var(--mono); position: relative; z-index: 1; }
-.kc-ws.dup { color: var(--danger); font-weight: 600; }
 .quota-bars { margin: 12px 0 10px; display: flex; flex-direction: column; gap: 7px; position: relative; z-index: 1; }
 .qbar-row { display: grid; grid-template-columns: 38px 1fr 104px; align-items: center; gap: 9px; font-size: 12px; }
 .qbar-label { color: var(--ink-soft); font-family: var(--serif); font-weight: 600; }
@@ -296,9 +294,9 @@ main {
   background-size: 200% 100%; animation: barShine 3.5s linear infinite;
 }
 @keyframes barShine { from { background-position: 200% 0; } to { background-position: -200% 0; } }
-.qbar-fill.rolling { background: linear-gradient(90deg, var(--accent-2), var(--accent)); }
-.qbar-fill.weekly { background: linear-gradient(90deg, #f0c060, var(--accent-2)); }
-.qbar-fill.monthly { background: linear-gradient(90deg, #5cc88a, var(--ok)); }
+.qbar-fill.ok { background: linear-gradient(90deg, #5cc88a, var(--ok)); }
+.qbar-fill.warn { background: linear-gradient(90deg, #f0c060, var(--accent-2)); }
+.qbar-fill.over { background: linear-gradient(90deg, var(--danger-soft), var(--danger)); }
 .qbar-reset { color: var(--muted); text-align: right; font-family: var(--mono); font-size: 10.5px; white-space: nowrap; }
 .kc-foot {
   display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap;
