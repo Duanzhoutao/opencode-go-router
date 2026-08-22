@@ -20,7 +20,7 @@ OpenCode Go 订阅的每个 Key 有 **5 小时滚动 / 每周 / 每月** 三重�
 - **会话粘性（`x-session-id`）**：同一会话永远走同一 Key，模型上下文缓存不因轮换失效；跨会话自动分配到不同 Key。
 - **限额感知调度**：每 15 分钟轮询 `/usage` 三窗口用量（5h 滚动 / 周 / 月，含 `resetsAt`）；月额度将尽的 Key 进入 drain（优先用完丢弃），其余按周余量平衡分配。
 - **透明 failover**：上游 429/5xx 时缓冲首字节后自动换下一个可用 Key（failoverChain 兜底），对客户端无感知。
-- **备用通道（通用 OpenAI 协议兜底）**：全部 Go Key 不可用时自动切到任意 OpenAI 兼容上游（默认 DeepSeek 官方，火山方舟等均可），请求模型自动改写；任一 Go Key 恢复立刻切回。DeepSeek 官方可选**余额差值自动计费**（人民币快照差值 + 15 分钟采样 + 关网关补结算），其他端点不计费模式。
+- **备用通道（通用 OpenAI 协议兜底）**：全部 Go Key 不可用时自动切到任意 OpenAI 兼容上游（默认 DeepSeek 官方，火山方舟等均可），请求模型自动改写、思考强度默认拉满（`reasoning_effort=max`，各厂取值不同，可改或留空交上游默认）；任一 Go Key 恢复立刻切回。DeepSeek 官方可选**余额差值自动计费**（人民币快照差值 + 15 分钟采样 + 关网关补结算），其他端点不计费模式。
 - **空回复重试优化（`retryEmptyResponse`，默认开）**：上游长思考后偶发零正文空流，客户端会判 `empty_model_response` 且不重试；网关在首个正文字节前缓冲整条流，空回复则零字节掐断连接，触发客户端网络级自动重试。可在设置页关闭。
 - **同池检测**：从 429 响应 metadata 提取 workspace id，同 workspace 的 Key 标记「同池」并告警——提示轮换它们无效。
 - **状态机管理**：`active / cooldown_rolling / cooldown_weekly / quarantined / invalid` 五态 + 冷却截止时间；月限 Key 按重置时钟自动复查回池；支持手动停用、删除、复活、隔离。
@@ -155,7 +155,7 @@ ZCode 配置示例：
 | `GET` | `/api/events` | 事件日志 |
 | `POST` | `/api/events/clear` | 清空事件日志 |
 | `GET` / `PATCH` | `/api/config` | 读/改调度参数（见下） |
-| `GET` / `PATCH` | `/api/fallback` | 读/改备用通道配置（baseURL/模型/Key/计费模式） |
+| `GET` / `PATCH` | `/api/fallback` | 读/改备用通道配置（baseURL/模型/Key/计费模式/思考强度） |
 | `POST` | `/api/fallback/refresh` | 备用费用「立刻计算」 |
 | `POST` | `/api/fallback/test` | 备用通道「测试连接」（支持未保存的候选配置） |
 | `GET` | `/api/guide` | Agent 对接指引提示词（运行时生成） |
@@ -170,7 +170,7 @@ ZCode 配置示例：
 | `retryEmptyResponse` | `true` | bool（空回复重试优化，默认开；关闭后完全透明直通） |
 | `localToken` | `null` | 字符串 ≥4 字符；设空字符串清除 |
 
-完整 API 说明与示例见 [docs/api.md](docs/api.md)，全部配置（含备用通道七字段）见 [docs/configuration.md](docs/configuration.md)。
+完整 API 说明与示例见 [docs/api.md](docs/api.md)，全部配置（含备用通道八字段）见 [docs/configuration.md](docs/configuration.md)。
 
 ## 环境变量
 

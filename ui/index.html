@@ -110,17 +110,19 @@
       <details class="mech">
         <summary>机制说明</summary>
         <div class="mech-body">
-          Key 的 5h / 周 / 月任一窗口打满即不可用；手动停用与失效 Key 不计入。兜底请求的模型一律改写为下方配置的模型，客户端无感知。计费：DeepSeek 官方支持按余额差值自动计费，其他端点选「不计费」。
+          Key 的 5h / 周 / 月任一窗口打满即不可用；手动停用与失效 Key 不计入。兜底请求的模型一律改写为下方配置的模型、思考强度默认拉满（均可改），客户端无感知。计费：DeepSeek 官方支持按余额差值自动计费，其他端点选「不计费」。
         </div>
       </details>
       <form id="fallbackForm" class="form-col">
         <label class="inline"><input type="checkbox" id="fbEnabled"> 启用备用通道</label>
         <label>名称<input type="text" id="fbLabel" placeholder="官方 DeepSeek" autocomplete="off"></label>
-        <label>Base URL<input type="text" id="fbBaseURL" placeholder="https://api.deepseek.com（留空用官方）" autocomplete="off">
+        <label>Base URL<input type="text" id="fbBaseURL" placeholder="留空 = 当前生效（自动）" autocomplete="off">
           <span class="field-note">支持任何 OpenAI 兼容端点（DeepSeek 官方、火山方舟等）</span></label>
         <label>API Key<input type="password" id="fbApiKey" placeholder="sk-…（已保存则留空保持不变）" autocomplete="off">
           <span class="field-note">仅存本机，不回显</span></label>
-        <label>模型名<input type="text" id="fbModel" placeholder="deepseek-v4-flash-vision-exp（兜底时所有请求都改用此模型）" autocomplete="off"></label>
+        <label>模型名<input type="text" id="fbModel" placeholder="留空 = 当前生效（自动）" autocomplete="off"></label>
+        <label>思考强度（reasoning_effort）<input type="text" id="fbReasoningEffort" placeholder="留空 = 当前生效（自动）" autocomplete="off">
+          <span class="field-note">注入备用请求的思考强度值，各厂取值不同（DeepSeek 官方 low/high/max，拉满填 max）；留空 = 不注入，交给上游默认</span></label>
         <label>计费模式
           <div id="fbBillingDD"></div>
         </label>

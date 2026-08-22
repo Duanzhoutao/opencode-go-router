@@ -256,7 +256,12 @@ function renderFallback() {
     $("#fbApiKey").value = "";
     $("#fbApiKey").placeholder = cfg.apiKey ? "已保存（留空保持不变）" : "sk-…";
     $("#fbModel").value = cfg.model || "";
+    $("#fbReasoningEffort").value = cfg.reasoningEffort || "";
     if (typeof fbBillingDD !== "undefined") fbBillingDD.set(cfg.billingMode || "balance");
+    // 虚影 = 当前生效配置（留空该字段时实际会用的值），让用户一眼看到现状与是否已配置
+    $("#fbBaseURL").placeholder = `留空 = 当前生效 ${fb.effectiveBaseURL || ""}`;
+    $("#fbModel").placeholder = `留空 = 当前生效 ${cfg.model || ""}`;
+    $("#fbReasoningEffort").placeholder = cfg.reasoningEffort ? `留空 = 当前生效 ${cfg.reasoningEffort}` : "留空 = 不注入（交上游默认）";
   }
   // 状态徽标 + 概要
   $("#fbActiveBadge").classList.toggle("hidden", !fb.active);
@@ -275,7 +280,7 @@ function renderFallback() {
       ["quarantined", "不计费", "该通道无自动计费"],
     ].map(([cls, num, lbl]) => `<div class="stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`).join("");
   $$("#fbWindows [data-win]").forEach((b) => b.classList.toggle("primary", b.dataset.win === fbWin));
-  $("#fbWindowDetail").textContent = `生效端点：${fb.effectiveBaseURL} · 模型：${cfg.model || "—"}${fb.lastFallbackAt ? " · 最近兜底 " + fmtTs(fb.lastFallbackAt) : ""}`;
+  $("#fbWindowDetail").textContent = `生效端点：${fb.effectiveBaseURL} · 模型：${cfg.model || "—"}${cfg.reasoningEffort ? " · 思考强度：" + cfg.reasoningEffort : ""}${fb.lastFallbackAt ? " · 最近兜底 " + fmtTs(fb.lastFallbackAt) : ""}`;
   // 结算表
   const tb = $("#fbSettleTable tbody");
   tb.innerHTML = fb.settlements && fb.settlements.length ? fb.settlements.map((s) => `<tr>
@@ -301,6 +306,7 @@ async function saveFallback(e) {
     label: $("#fbLabel").value.trim(),
     baseURL: $("#fbBaseURL").value.trim(),
     model: $("#fbModel").value.trim(),
+    reasoningEffort: $("#fbReasoningEffort").value.trim(),
     billingMode: (typeof fbBillingDD !== "undefined" && fbBillingDD.get()) || "balance",
   };
   const k = $("#fbApiKey").value.trim();

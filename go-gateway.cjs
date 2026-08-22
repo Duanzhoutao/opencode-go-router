@@ -83,6 +83,7 @@ function defaultState() {
         baseURL: "",                  // 留空回退 DeepSeek 官方默认（FALLBACK_DEFAULT_BASE）
         apiKey: null,                 // 前端填写保存；GET /api/config 掩码 "(set)"
         model: "deepseek-v4-flash-vision-exp", // 兜底时一律改写为该模型
+        reasoningEffort: "max",       // 思考强度（OpenAI 字段 reasoning_effort），默认拉满；各厂取值不同，留空=不注入
         billingMode: "balance",       // balance=DeepSeek 官方 /user/balance 自动计费 | none=不计费
         balanceSampleMs: 15 * 60 * 1000,
       },
@@ -607,11 +608,12 @@ function fallbackUpstream(baseURL) {
   };
 }
 // OpenAI 标准字段白名单：模型一律改写为通道模型；Go 平台私有扩展字段剔除（防上游 400）
-const FALLBACK_BODY_FIELDS = ["messages", "stream", "stream_options", "temperature", "top_p", "max_tokens", "stop", "tools", "tool_choice", "response_format", "presence_penalty", "frequency_penalty", "seed", "user"];
+const FALLBACK_BODY_FIELDS = ["messages", "stream", "stream_options", "temperature", "top_p", "max_tokens", "stop", "tools", "tool_choice", "response_format", "reasoning_effort", "presence_penalty", "frequency_penalty", "seed", "user"];
 function buildFallbackBody(payload, withUsage, modelOverride) {
   const f = fallbackConfig();
   const body = { model: modelOverride || f.model, messages: payload.messages };
   for (const k of FALLBACK_BODY_FIELDS) if (payload[k] !== undefined) body[k] = payload[k];
+  if (f.reasoningEffort != null && f.reasoningEffort !== "") body.reasoning_effort = f.reasoningEffort; // 思考强度：配置优先（默认拉满），留空透传客户端
   if (withUsage && body.stream) body.stream_options = { ...(body.stream_options || {}), include_usage: true };
   return body;
 }
@@ -937,6 +939,7 @@ async function handleFallbackPatch(req, res) {
   if (body.apiKey === "" || body.apiKey === null) f.apiKey = null;
   else if (typeof body.apiKey === "string" && body.apiKey.trim().length >= 8) f.apiKey = body.apiKey.trim();
   if (typeof body.model === "string" && body.model.trim()) f.model = body.model.trim().slice(0, 120);
+  if (typeof body.reasoningEffort === "string") f.reasoningEffort = body.reasoningEffort.trim().slice(0, 40);
   if (body.billingMode === "balance" || body.billingMode === "none") f.billingMode = body.billingMode;
   addEvent("config", null, "fallback config updated (enabled=" + f.enabled + ", model=" + f.model + ")");
   saveState();

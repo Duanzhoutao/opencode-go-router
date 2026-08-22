@@ -42,6 +42,7 @@ GO_PORT=9000 GO_LOG=~/go.log node go-gateway.cjs
 | `baseURL` | 空 | **留空回退 DeepSeek 官方** `https://api.deepseek.com`；可填任何 OpenAI 兼容端点（火山方舟等） |
 | `apiKey` | `null` | 备用上游的 API Key，前端填写保存；控制面回读一律掩码 `(set)`，代码不写死任何 Key |
 | `model` | `deepseek-v4-flash-vision-exp` | 兜底时请求模型**一律改写**为该值 |
+| `reasoningEffort` | `max` | 思考强度：注入备用请求体的 `reasoning_effort` 字段。各厂取值映射不同（DeepSeek 官方 `low`/`high`/`max`，拉满用 `max`；其他厂可能是 `xhigh`/`Ultra` 等，照其文档填）；留空 = 不注入（客户端若传了该字段则透传），交给上游默认 |
 | `billingMode` | `balance` | `balance` = DeepSeek 官方余额差值自动计费；`none` = 不计费（其他端点用） |
 | `balanceSampleMs` | `900000`（15 分钟） | 余额采样间隔（仅 balance 模式） |
 

@@ -82,7 +82,7 @@ OpenCode Go 的上下文缓存**跟随 Key**：换一把 Key，缓存全部失�
 ## 备用通道（通用 OpenAI 协议兜底）
 
 - **触发条件**：候选集合（非 `invalid`、非手动停用）中**没有任何 `active` Key**——即三窗口语义下全部 Key 不可用时。触发判定用本地状态，请求路径零额外网络往返。
-- **转发行为**：`model` 一律改写为备用通道配置的模型；请求体按 OpenAI 标准字段白名单重建（`messages/stream/temperature/top_p/max_tokens/stop/tools/tool_choice/response_format/presence_penalty/frequency_penalty/seed/user` 等），剔除 Go 平台私有扩展字段；流式请求注入 `include_usage`（上游 400 报错则去掉注入重试一次）。
+- **转发行为**：`model` 一律改写为备用通道配置的模型；请求体按 OpenAI 标准字段白名单重建（`messages/stream/temperature/top_p/max_tokens/stop/tools/tool_choice/response_format/reasoning_effort/presence_penalty/frequency_penalty/seed/user` 等），剔除 Go 平台私有扩展字段；思考强度按配置注入 `reasoning_effort`（`reasoningEffort` 默认 `max` 拉满——Agent 场景官方推荐档，各厂取值不同，留空则透传客户端值）；流式请求注入 `include_usage`（上游 400 报错则去掉注入重试一次）。
 - **自动切回**：任何一把 Go Key 恢复 `active`（窗口重置复查、轮询发现、手动恢复），下一个请求立刻切回 Go（事件 `fallback:end`，via=go-recovered）。宪法：**优先保证体验（Go 订阅额度），备用只花必要的钱**。
 - **计费（`billingMode=balance`，DeepSeek 官方模式）**：金额唯一口径 = 官方 `/user/balance` 余额快照差值（人民币）。切进备用时快照一次、切回时快照一次，差值即本周期实际花费；每 15 分钟定时采样 + 仪表盘「立刻计算」按钮；网关关闭时有未结算周期，下次启动自动补结算（差值入账）。token 明细仅作参考，不用 token 估算金额。
 - **`billingMode=none`**：任何不支持余额查询的 OpenAI 兼容端点（如火山方舟）选此项——不计费、不显示费用区，功能不受影响。
