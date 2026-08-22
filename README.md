@@ -60,6 +60,7 @@
 │       ├── dt-guard.cjs
 │       └── README.md                # 部署/复现/回退手册（含 v1/v2/v3 决策记录）
 ├── go-gateway.cjs                   # 网关本体（转发/调度/状态机/控制面 API/静态前端）
+├── go-guard.cjs                     # 生命周期守护（跟随 ZCode 启停，母本 reference/dt-mcp-watch/dt-guard.cjs）
 ├── ui/                              # 前端六视图（index.html / app.js / style.css，纯原生）
 ├── keys.json                        # 运行态：Key/状态/会话绑定（0600，已 gitignore，不入库）
 └── project-context/                 # 归档：status-NNN-YYYYMMDD.md
@@ -70,7 +71,7 @@
 - `go-gateway.cjs`：网关本体（Node 24 原生 http/https，零依赖），含转发面 `/v1/chat/completions`（x-session-id 粘性 + 缓冲首字节 failover + SSE 透传 + 429 metadata 解析）、控制面 `/api/*`（keys/sessions/events/status/config）、状态机（active/cooldown_rolling/cooldown_weekly/quarantined/invalid）、/usage 轮询、MOCK_MODE、静态前端托管。
 - `ui/`：六视图本地单页（总览/Key 管理/隔离区/会话绑定/事件日志/设置），浅色玻璃质感主题（奶油白偏棕 + backdrop-filter 磨砂 + 琥珀/翠绿高饱和点缀 + 底部波浪流水 + 衬线标题）。
 - `keys.json`：Key、状态、冷却截止、隔离记录、会话绑定表（运行态，**真实 Key 不入库**，已入 `.gitignore`）。
-- `go-guard.cjs`：生命周期守护（下阶段，照抄 `reference/dt-mcp-watch/dt-guard.cjs`，端口 8788）。
+- `go-guard.cjs`：生命周期守护（**已实现**，照抄 `reference/dt-mcp-watch/dt-guard.cjs` 参数化：端口 8788、锁/日志在 `~/.opencode-go-router/`、`GO_GUARD_TEST_ZCODE`/`GO_GUARD_IDLE_S` 测试 env）；已挂 ZCode `~/.zcode/cli/config.json` 的 SessionStart 钩子（与现有 dt-guard 钩子并列，互不干扰）。
 
 ## 运行
 
@@ -82,7 +83,9 @@ node go-gateway.cjs
 MOCK_MODE=1 GO_STATE_DIR=/tmp/mockstate node go-gateway.cjs
 ```
 
-启动后浏览器打开 `http://127.0.0.1:8788`。环境变量：`GO_PORT`（默认 8788）、`GO_LOG`（日志文件）、`GO_STATE_DIR`（状态目录）、`MOCK_MODE=1`。
+启动后浏览器打开 `http://127.0.0.1:8788`。环境变量：`GO_PORT`（默认 8788）、`GO_LOG`（日志文件）、`GO_STATE_DIR`（状态目录）、`MOCK_MODE=1`；也支持 `--port <N>` CLI 参数（go-guard 用它精确定位进程）。
+
+**生命周期（跟随 ZCode 启停）**：ZCode 会话启动时 SessionStart 钩子自动拉起网关，ZCode 退出满 60s 自动停网关、释放锁。手动测试守护：`GO_GUARD_TEST_ZCODE=1|0 GO_GUARD_IDLE_S=5 node go-guard.cjs`；回归：`bash bug/regression/go-guard-verify.sh`。
 
 ZCode 对接（一次性）：`C:\Users\duanz\.zcode\v2\config.json` 的 OpencodeGo provider `ce6a858a` 把 `options.baseURL` 改为 `http://127.0.0.1:8788/v1`、`apiKey` 改占位符；另保留一个 disabled 的直连逃生门 provider。
 

@@ -28,7 +28,16 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 
-const PORT = Number(process.env.GO_PORT) || 8788;
+// 端口来源：GO_PORT 环境变量 > --port CLI 参数（go-guard 守护用它精确定位进程）> 默认 8788
+function cliPort() {
+  const i = process.argv.indexOf("--port");
+  if (i >= 0 && process.argv[i + 1]) {
+    const n = Number(process.argv[i + 1]);
+    if (Number.isInteger(n) && n > 0 && n < 65536) return n;
+  }
+  return 0;
+}
+const PORT = Number(process.env.GO_PORT) || cliPort() || 8788;
 const MOCK = process.env.GO_MOCK_MODE === "1" || process.env.MOCK_MODE === "1";
 const STATE_DIR = process.env.GO_STATE_DIR || __dirname;
 const STATE_FILE = path.join(STATE_DIR, "keys.json");
