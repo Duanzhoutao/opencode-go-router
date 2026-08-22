@@ -5,7 +5,7 @@ const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
 const STATUS_LABEL = {
-  active: "active",
+  active: "可用",
   cooldown_rolling: "5h 冷却",
   cooldown_weekly: "周限冷却",
   quarantined: "隔离",
@@ -95,9 +95,6 @@ function renderTopbar() {
   $("#gwMode").textContent = st ? `v${st.version} · ${st.mode === "mock" ? "MOCK" : "real"}` : "未连接";
   const dot = $("#gwDot");
   dot.className = "dot " + (st ? "up" : "down");
-  const q = state.keys.filter((k) => k.status === "quarantined" || k.status === "invalid").length;
-  const badge = $("#qBadge");
-  if (q > 0) { badge.textContent = q; badge.classList.remove("hidden"); } else badge.classList.add("hidden");
 }
 
 function showBanner(msg, isErr) {
@@ -126,11 +123,11 @@ function renderOverview() {
   const st = state.status;
   const counts = st ? st.counts : { active: 0, cooldown: 0, quarantined: 0, invalid: 0 };
   $("#statCards").innerHTML = [
-    ["active", counts.active, "active"],
-    ["cooldown", counts.cooldown, "cooldown"],
-    ["quarantined", counts.quarantined, "quarantined"],
-    ["invalid", counts.invalid, "invalid"],
-    ["requests", st ? st.totalRequests : 0, "total 请求"],
+    ["active", counts.active, "可用"],
+    ["cooldown", counts.cooldown, "冷却"],
+    ["quarantined", counts.quarantined, "隔离"],
+    ["invalid", counts.invalid, "失效"],
+    ["requests", st ? st.totalRequests : 0, "总请求"],
     ["cached", st ? st.totalCachedTokens : 0, "缓存 token"],
   ].map(([cls, num, lbl]) => `<div class="stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`).join("");
 
@@ -261,6 +258,44 @@ function renderSettings() {
 # 改配置后需新建会话 / 重启 ZCode 生效（Key 在 provider 构造时固化）。`;
 }
 
+// ---------- 主题化弹层（替换原生 confirm/prompt） ----------
+function uiDialog({ title, message, kind = "confirm", defaultValue = "", confirmText = "确定", cancelText = "取消", danger = false }) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal" role="dialog" aria-modal="true">
+        <h3 class="modal-title">${esc(title)}</h3>
+        <p class="modal-msg">${esc(message)}</p>
+        ${kind === "prompt" ? `<input class="modal-input" type="text" value="${esc(defaultValue)}" autocomplete="off">` : ""}
+        <div class="modal-actions">
+          <button class="btn modal-cancel">${esc(cancelText)}</button>
+          <button class="btn ${danger ? "danger" : "primary"} modal-ok">${esc(confirmText)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => overlay.classList.add("show"));
+    const finish = (val) => {
+      overlay.classList.remove("show");
+      setTimeout(() => overlay.remove(), 180);
+      resolve(val);
+    };
+    const okBtn = overlay.querySelector(".modal-ok");
+    const cancelBtn = overlay.querySelector(".modal-cancel");
+    const input = overlay.querySelector(".modal-input");
+    cancelBtn.addEventListener("click", () => finish(kind === "prompt" ? null : false));
+    okBtn.addEventListener("click", () => finish(kind === "prompt" ? input.value : true));
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) finish(kind === "prompt" ? null : false); });
+    overlay.addEventListener("keydown", (e) => { if (e.key === "Escape") finish(kind === "prompt" ? null : false); });
+    if (input) {
+      input.focus(); input.select();
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") okBtn.click(); });
+    } else {
+      cancelBtn.focus();
+    }
+  });
+}
+
 // ---------- 动作 ----------
 async function actRefresh(id) {
   try {
@@ -271,7 +306,7 @@ async function actRefresh(id) {
 }
 
 async function actQuarantine(id) {
-  if (!confirm("手动停用该 Key（进隔离区）？")) return;
+  if (!(await uiDialog({ title: "手动停用", message: "手动停用该 Key（进隔离区）？停用后移出调度与轮询。", confirmText: "停用", danger: true }))) return;
   try { await api(`/api/keys/${id}/quarantine`, { method: "POST" }); toast("已停用"); } catch (e) { toast(e.message, true); }
   refreshAll(true);
 }
@@ -286,24 +321,22 @@ async function actReactivate(id) {
 
 async function actDelete(id) {
   const k = state.keys.find((x) => x.id === id);
-  if (!confirm(`彻底删除 Key「${k ? k.label : id}」？`)) return;
+  if (!(await uiDialog({ title: "彻底删除", message: `彻底删除 Key「${k ? k.label : id}」？此操作不可恢复。`, confirmText: "删除", danger: true }))) return;
   try { await api(`/api/keys/${id}`, { method: "DELETE" }); toast("已删除"); } catch (e) { toast(e.message, true); }
   refreshAll(true);
 }
 
-function actEdit(id) {
+async function actEdit(id) {
   const k = state.keys.find((x) => x.id === id);
   if (!k) return;
-  const label = prompt("显示名称：", k.label);
+  const label = await uiDialog({ kind: "prompt", title: "编辑显示名", message: "显示名称：", defaultValue: k.label, confirmText: "保存" });
   if (label == null) return;
-  const val = prompt("Key 值（留空保持不变）：", "");
+  const val = await uiDialog({ kind: "prompt", title: "编辑 Key 值", message: "Key 值（留空保持不变）：", defaultValue: "", confirmText: "保存" });
   const body = { label };
   if (val && val.trim()) body.key = val.trim();
-  (async () => {
-    try { await api(`/api/keys/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已保存"); }
-    catch (e) { toast(e.message, true); }
-    refreshAll(true);
-  })();
+  try { await api(`/api/keys/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已保存"); }
+  catch (e) { toast(e.message, true); }
+  refreshAll(true);
 }
 
 // 添加 Key
@@ -380,7 +413,7 @@ $("#toggleNewKey").addEventListener("click", () => {
   i.type = i.type === "password" ? "text" : "password";
 });
 $("#btnClearEvents").addEventListener("click", async () => {
-  if (!confirm("清空事件日志？")) return;
+  if (!(await uiDialog({ title: "清空事件日志", message: "清空事件日志？此操作不可恢复。", confirmText: "清空", danger: true }))) return;
   try { await api("/api/events/clear", { method: "POST" }); toast("已清空"); } catch (err) { toast(err.message, true); }
   refreshAll(true);
 });
