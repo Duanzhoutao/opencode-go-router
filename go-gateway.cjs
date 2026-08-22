@@ -41,6 +41,13 @@ const UPSTREAM_BASE = "/zen/go/v1";
 // node 原生 https 的 TLS 指纹已实测可过 Cloudflare（2026-08-22，urllib 会 1010）；仍带常规 UA 保险
 const OUT_UA = `OpenCodeGoGateway/${VERSION} (local; 127.0.0.1:${PORT})`;
 
+// 瞬时错误判定与重试策略：网络错/超时（网关 502）与上游 5xx 视为瞬时，同 key 重试后再 failover；
+// 429（限额）/401（失效）不重试，直接切换。failover 有界防死循环（BUG-002/006）。
+const SAME_KEY_RETRIES = 2;                     // 瞬时错误同 key 重试次数
+const MAX_FAILOVER = 4;                         // failover 总尝试上限（每把 key 至多一次）
+const TRANSIENT = (s) => s === 502 || (s >= 500 && s < 600);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ---------------- 日志 ----------------
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(" ")}`;
@@ -57,7 +64,8 @@ function defaultState() {
     updatedAt: new Date().toISOString(),
     config: {
       pollIntervalMs: 15 * 60 * 1000, // /usage 主动轮询默认 15min
-      preSwitchPct: 90,               // 预切换阈值（rolling/weekly/monthly ≥ 此值提前迁移）
+      preSwitchPct: 90,               // 预切换阈值：rolling 5h 窗口 ≥ 此值提前迁移
+      preSwitchWeeklyPct: 95,         // 预切换阈值：weekly 周窗口 ≥ 此值提前迁移（与 rolling 分档，BUG-004）
       concurrencyPerKey: 1,           // 每 Key 并发上限
       localToken: null,               // 可选本地 token：设置后转发面与控制面要求 Bearer
       stickyEnabled: true,            // x-session-id 粘性开关
@@ -193,25 +201,73 @@ const inflightDec = (id) => inflight.set(id, Math.max(0, (inflight.get(id) || 0)
 
 const quotaPercent = (k, w) => (k.quota && k.quota[w] ? k.quota[w].percent : 0);
 
-function shouldPreSwitch(key) {
-  const pct = state.config.preSwitchPct;
-  return quotaPercent(key, "rolling") >= pct || quotaPercent(key, "weekly") >= pct || quotaPercent(key, "monthly") >= pct;
+// ---------------- 反浪费（drain）调度：缓存核心（BUG-008） ----------------
+// 核心：网关唯一优化目标 = 提示词缓存命中率（切换对 ZCode 无感、代价为零）→ 会话粘性 = 缓存积累。
+// 月额度将尽（剩余 < 5h 窗口 ≈ monthly ≥80%，或临近续费日仍有剩余）的 key 注定死亡：
+// 其缓存无未来价值（会话迟早迁走、必刷新一次）→ 周额度无关紧要 → 最高优先用完丢弃。
+// 只有月额度健康的 key 才谈周平衡/防封。
+const DRAIN_MONTHLY_PCT = 80;    // monthly ≥80% ≈ 剩余 <5h 窗口（$12/$60）
+const DRAIN_RENEWAL_HOURS = 72;  // 距 monthly.resetsAt（=订阅续费日）≤72h 且仍有剩余
+
+function isDrainKey(k) {
+  const m = k.quota && k.quota.monthly;
+  if (!m) return false;
+  if (m.percent >= DRAIN_MONTHLY_PCT) return true;
+  if (m.percent > 0 && m.resetsAt) {
+    const hours = (new Date(m.resetsAt).getTime() - Date.now()) / 3600e3;
+    if (hours <= DRAIN_RENEWAL_HOURS) return true;
+  }
+  return false;
 }
 
-// 新会话 / 迁移分配：active 里按「周剩余最多优先（percent 最小）→ 5h 剩余 → 并发保护」
-function pickBestKey(excludeId) {
+// 排序：drain 优先（到期近→剩余少），其余 balance（周剩余多→5h 剩余多→并发少）
+function compareKeys(a, b) {
+  const da = isDrainKey(a) ? 0 : 1;
+  const db = isDrainKey(b) ? 0 : 1;
+  if (da !== db) return da - db;
+  if (da === 0) {
+    const ra = (a.quota.monthly && a.quota.monthly.resetsAt) || "";
+    const rb = (b.quota.monthly && b.quota.monthly.resetsAt) || "";
+    if (ra !== rb) return ra < rb ? -1 : 1;
+    return quotaPercent(b, "monthly") - quotaPercent(a, "monthly");
+  }
+  const dWeekly = quotaPercent(a, "weekly") - quotaPercent(b, "weekly");
+  const dRolling = quotaPercent(a, "rolling") - quotaPercent(b, "rolling");
+  const dInflight = (inflight.get(a.id) || 0) - (inflight.get(b.id) || 0);
+  return dWeekly || dRolling || dInflight;
+}
+
+function shouldPreSwitch(key) {
+  // 5h/周 分档阈值（BUG-004）；monthly 不触发（月额度走 drain：用完即弃，绝不因 high percent 弃用）
+  const pct = state.config.preSwitchPct;
+  const wpct = state.config.preSwitchWeeklyPct != null ? state.config.preSwitchWeeklyPct : 95;
+  return quotaPercent(key, "rolling") >= pct || quotaPercent(key, "weekly") >= wpct;
+}
+
+// 新会话 / 迁移分配：drain（月额度将尽）优先用完丢弃，其余按「周剩余最多→5h 剩余→并发」平衡
+function pickBestKey(excludeId, skipIds) {
   const cap = state.config.concurrencyPerKey;
-  const actives = state.keys.filter((k) => k.status === "active" && k.id !== excludeId);
+  const actives = state.keys.filter((k) => k.status === "active" && k.id !== excludeId && !(skipIds && skipIds.has(k.id)));
   if (!actives.length) return null;
   const underCap = actives.filter((k) => (inflight.get(k.id) || 0) < cap);
   const pool = underCap.length ? underCap : actives;
-  pool.sort((a, b) => {
-    const dWeekly = quotaPercent(a, "weekly") - quotaPercent(b, "weekly");
-    const dRolling = quotaPercent(a, "rolling") - quotaPercent(b, "rolling");
-    const dInflight = (inflight.get(a.id) || 0) - (inflight.get(b.id) || 0);
-    return dWeekly || dRolling || dInflight;
-  });
+  pool.sort(compareKeys);
   return pool[0];
+}
+
+// 预切换目标：健康（非 drain）key 中剩余最多者；无则 null（不动，让 429 failover 兜底）
+function pickPreSwitchTarget(bound) {
+  const pool = state.keys.filter((k) => k.status === "active" && k.id !== bound.id && !isDrainKey(k));
+  if (!pool.length) return null;
+  pool.sort(compareKeys);
+  return pool[0];
+}
+
+// BUG-003：预切换目标须「明显更鲜」（任一窗口低 ≥10 个百分点），否则不切，防止多 key 近限时 ping-pong 毁缓存
+const PRECHECK_MARGIN = 10;
+function meaningfullyFresher(alt, bound) {
+  return quotaPercent(alt, "rolling") <= quotaPercent(bound, "rolling") - PRECHECK_MARGIN ||
+         quotaPercent(alt, "weekly") <= quotaPercent(bound, "weekly") - PRECHECK_MARGIN;
 }
 
 function bindSession(sessionId, key) {
@@ -245,17 +301,14 @@ function getOrBindKey(sessionId) {
     if (sess) {
       const bound = state.keys.find((k) => k.id === sess.keyId);
       if (bound && bound.status === "active") {
-        if (shouldPreSwitch(bound)) {
-          const alt = pickBestKey(bound.id);
-          if (alt) { bindSession(sessionId, alt); return alt; }
+        // drain key（月额度将尽）：缓存注定丢失 → 绝不预切换走，留着用完即弃
+        if (!isDrainKey(bound) && shouldPreSwitch(bound)) {
+          const alt = pickPreSwitchTarget(bound);
+          if (alt && meaningfullyFresher(alt, bound)) { bindSession(sessionId, alt); return alt; }
         }
         return bound;
       }
-      if (bound && bound.status === "cooldown_rolling" && quotaPercent(bound, "rolling") < state.config.preSwitchPct) {
-        // rolling 冷却但未到预切换线：仍可用（rolling 窗口内限流，周/月可能健康）
-        return bound;
-      }
-      // 绑定 Key 不可用 -> 重分配
+      // 绑定 Key 不可用（cooldown_*/quarantined/invalid）-> 重分配；rolling 冷却 key 一律不可服务（BUG-001）
       const alt = pickBestKey(null);
       if (alt) { bindSession(sessionId, alt); return alt; }
       return null;
@@ -267,6 +320,10 @@ function getOrBindKey(sessionId) {
 }
 
 // ---------------- 转发面（L4） ----------------
+// BUG-001：429 命中窗口时同步标记 quota 状态，避免下游（轮询状态机/调度）读到过期 status 而误判
+function markWindowLimited(key, w) {
+  if (key.quota && key.quota[w]) key.quota[w].status = "rate-limited";
+}
 function handleUpstreamError(key, status, bodyText) {
   let parsed = null;
   try { parsed = JSON.parse(bodyText); } catch {}
@@ -275,9 +332,9 @@ function handleUpstreamError(key, status, bodyText) {
   if (status === 429 && parsed && parsed.error && parsed.error.type === "GoUsageLimitError") {
     if (meta.workspace && !key.workspaceId) key.workspaceId = meta.workspace;
     const ln = meta.limitName;
-    if (ln === "monthly") quarantine(key, "monthly");
-    else if (ln === "weekly") cooldown(key, "cooldown_weekly", "weekly");
-    else if (ln === "rolling") cooldown(key, "cooldown_rolling", "rolling");
+    if (ln === "monthly") { quarantine(key, "monthly"); markWindowLimited(key, "monthly"); }
+    else if (ln === "weekly") { cooldown(key, "cooldown_weekly", "weekly"); markWindowLimited(key, "weekly"); }
+    else if (ln === "rolling") { cooldown(key, "cooldown_rolling", "rolling"); markWindowLimited(key, "rolling"); }
     addEvent("rate-limited", key.id, `429 ${ln || "?"}${meta.workspace ? " ws=" + meta.workspace : ""}`);
     maybeWarnSamePool(key);
   } else if (status === 401) {
@@ -353,6 +410,51 @@ function streamThrough(clientRes, upRes, key, sessionId, model, started) {
   upRes.on("error", () => { try { clientRes.destroy(); } catch {} finishRequest(key, sessionId, model, started, cacheTokens); });
 }
 
+// 首字节前失败后的统一兜底（BUG-002/005/006）：
+//   1) 瞬时错误（5xx/网络/超时）先在原 key 上重试 SAME_KEY_RETRIES 次（限额/401 不重试）；
+//   2) 有界 failover：每把 key 至多试一次、总上限 MAX_FAILOVER（防死循环）；
+//   3) failover 成功当场把会话重绑到 fallback key（下个请求直连，避免晚一拍 + 计数归零）；
+//   4) 全部耗尽如实回最后错误（附最近恢复时间）。
+async function failoverChain(res, key, out, rawBody, clientHeaders, sessionId, model, started) {
+  inflightDec(key.id);
+  let last = out;
+  if (TRANSIENT(last.status)) {
+    for (let r = 0; r < SAME_KEY_RETRIES; r++) {
+      await sleep(300 * (r + 1));
+      inflightInc(key.id);
+      const retry = await attemptForward(key, rawBody, clientHeaders);
+      if (retry.stream) { streamThrough(res, retry.res, key, sessionId, model, started); return; }
+      inflightDec(key.id);
+      last = retry;
+      if (!TRANSIENT(last.status)) break; // 变为限额/401 -> 停止同 key 重试，走 failover
+    }
+  }
+  const tried = new Set([key.id]);
+  let fallback = null;
+  let attempts = 0;
+  while (attempts < MAX_FAILOVER && (fallback = pickBestKey(key.id, tried))) {
+    attempts++;
+    tried.add(fallback.id);
+    inflightInc(fallback.id);
+    addEvent("failover", key.id, `HTTP ${last.status} -> key ${fallback.id}`);
+    const nxt = await attemptForward(fallback, rawBody, clientHeaders);
+    if (nxt.stream) {
+      if (sessionId) bindSession(sessionId, fallback);
+      streamThrough(res, nxt.res, fallback, sessionId, model, started);
+      return;
+    }
+    inflightDec(fallback.id);
+    last = nxt;
+  }
+  // 全部 Key 耗尽：如实回最后错误（附最近恢复时间）
+  addEvent("exhausted", key.id, `all keys failed (last HTTP ${last.status})`);
+  const head = { "Content-Type": "application/json" };
+  if (last.retryAfter) head["Retry-After"] = last.retryAfter;
+  res.writeHead(last.status, head);
+  res.end(last.body || JSON.stringify({ error: { type: "GatewayError", message: "all keys exhausted" } }));
+  saveState();
+}
+
 // GET /v1/models 透传：ZCode 启动时探测模型/思考能力，必须 200 而非 404（公开无鉴权端点）
 function forwardModels(res) {
   const up = https.request({
@@ -390,25 +492,8 @@ function forwardChat(req, res) {
     if (out.stream) {
       streamThrough(res, out.res, key, sessionId, model, started);
     } else {
-      // 首字节前失败 -> failover 到下一把健康 Key 原样重放（请求体未消费）
-      inflightDec(key.id);
-      let last = out;
-      let fallback = null;
-      while ((fallback = pickBestKey(key.id))) {
-        inflightInc(fallback.id);
-        addEvent("failover", key.id, `HTTP ${last.status} -> key ${fallback.id}`);
-        const nxt = await attemptForward(fallback, rawBody, { accept: req.headers.accept, "x-request-id": req.headers["x-request-id"] });
-        if (nxt.stream) { streamThrough(res, nxt.res, fallback, sessionId, model, started); return; }
-        inflightDec(fallback.id);
-        last = nxt;
-      }
-      // 全部 Key 耗尽：如实回最后错误（附最近恢复时间）
-      addEvent("exhausted", key.id, `all keys failed (last HTTP ${last.status})`);
-      const head = { "Content-Type": "application/json" };
-      if (last.retryAfter) head["Retry-After"] = last.retryAfter;
-      res.writeHead(last.status, head);
-      res.end(last.body || JSON.stringify({ error: { type: "GatewayError", message: "all keys exhausted" } }));
-      saveState();
+      // 首字节前失败 -> 统一兜底：瞬时重试 → 有界 failover → 耗尽如实回错（BUG-002/005/006）
+      await failoverChain(res, key, out, rawBody, { accept: req.headers.accept, "x-request-id": req.headers["x-request-id"] }, sessionId, model, started);
     }
   });
 }
@@ -684,6 +769,7 @@ async function handlePatchConfig(req, res) {
   const c = state.config;
   if (typeof body.pollIntervalMs === "number" && body.pollIntervalMs >= 5 * 60 * 1000 && body.pollIntervalMs <= 60 * 60 * 1000) c.pollIntervalMs = body.pollIntervalMs;
   if (typeof body.preSwitchPct === "number" && body.preSwitchPct >= 0 && body.preSwitchPct <= 100) c.preSwitchPct = body.preSwitchPct;
+  if (typeof body.preSwitchWeeklyPct === "number" && body.preSwitchWeeklyPct >= 0 && body.preSwitchWeeklyPct <= 100) c.preSwitchWeeklyPct = body.preSwitchWeeklyPct;
   if (typeof body.concurrencyPerKey === "number" && body.concurrencyPerKey >= 1 && body.concurrencyPerKey <= 8) c.concurrencyPerKey = body.concurrencyPerKey;
   if (typeof body.stickyEnabled === "boolean") c.stickyEnabled = body.stickyEnabled;
   if (typeof body.localToken === "string" && body.localToken.length >= 4) c.localToken = body.localToken;

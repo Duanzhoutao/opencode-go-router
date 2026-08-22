@@ -35,3 +35,16 @@
 
 - 归档命名规范与回溯方式：见 `README.md` §归档命名规范。
 - 归档子文件夹：`project-context/status-*.md`（按序号递增回溯整段日志）。
+
+- 2026-08-22：key 切换逻辑走查 + 仿真（提取网关真实调度函数驱动 9 场景），确认 4 个真实问题：① rolling 429 不改 quota.percent 致 cooldown_rolling 特判每轮挑回耗尽 key（:254-257）；② failover 循环无上限，5xx/网络错/无 metadata 的 429 不改状态 → 无限重试同一把 key（:397-404）；③ 预切换无「更鲜才切」保护 → 全 key 近限时 ping-pong 毁缓存；④ 三档预切换阈值统一 90 且 monthly 参与，偏离设计 rolling90/weekly·monthly95。另有 failover 不重绑会话的一致性问题。多 key 轮换尚未在真实模式跑过（当前仅 1 key 且周限耗尽）。
+
+- 2026-08-22：kill-bug 登记建立 `bug/`（open-bugs.md / resolved-bugs.md / regression/key-switch-sim.cjs，断言式回归入口 `node bug/regression/key-switch-sim.cjs`，当前 PASS8/RED8/exit1）。登记 BUG-001~006（已仿真红灯）与 BUG-007（定时任务/无 title 会话请求标识未验证 + 缺统一兜底，假设验证中）。新确认缺陷：网络抖动不重试直接切 key（BUG-006，S10 实证 A=1/B=1）。
+
+- 2026-08-22：调度设计转向（反浪费）。用户确认：monthly 90% 不再弃用，改为「优先用掉快用完/快到期的 key，用完即弃，便于买新套餐换 key」。研究实证：monthly.resetsAt 即订阅/套餐续费日（本地 k2=2026-09-19≈28天=订阅周期，Reddit/ZIDOOKA 确认按月订阅周期重置），官方无独立到期接口（issue #16017/#31084 仍在请求），周/5h 窗口到点重置未用不结转。登记 BUG-008（反浪费 drain 调度缺失），BUG-004 方向随之转向。待确认：用户「每周额度比较少优先使用」与「优先用 weekly 更多」的取舍。
+
+- 2026-08-22：调度根因收敛为「缓存核心」。用户确认：网关唯一优化目标 = 提示词缓存命中率（切换对 ZCode 无感、代价为零），会话粘性 = 缓存积累。月额度将尽（剩余<5h窗口≈percent≥80%）的 key 注定死亡、缓存无未来价值、周额度无关 → 最高优先用完丢弃；仅月额度健康的 key 谈周平衡/防封。BUG-008 规格据此定稿，新增 S11 红灯（新会话应首选 drain key，当前实际选 B、红灯）。
+
+- 2026-08-22：BUG-008（反浪费 drain 调度）实现并回归通过（分支 fix/bug-008-drain-priority，未合入）。改动 `go-gateway.cjs`：新增 isDrainKey（monthly≥80% 或距 resetsAt≤72h 且有剩余）、compareKeys（drain 优先→到期近→剩余少；balance 周剩余多→5h→并发）、pickPreSwitchTarget（预切换避开 drain key）；shouldPreSwitch 移除 monthly；pickBestKey 用 compareKeys；getOrBindKey 绑定 key 为 drain 时绝不预切换走。回归 `bug/regression/key-switch-sim.cjs` PASS=13 RED=7：S7/S11/S12/S13/S14 全绿，其余 bug 红灯（S3/S6/S9/S10）原样保留。`node --check` 通过。真实 E2E 待 ≥2 把健康 key。
+
+- 2026-08-22：已知 bug 批量修复并回归通过（分支 fix/bug-008-drain-priority，未合入）。`go-gateway.cjs`：① BUG-001 删 cooldown_rolling 特判 + 429 同步标记 quota 窗口；② BUG-002/005/006 failover 逻辑抽取为 `failoverChain`（瞬时错误同 key 重试 2 次→有界 failover MAX_FAILOVER=4+skipIds→成功当场重绑会话→耗尽如实回错+恢复时间）；③ BUG-003 新增 `meaningfullyFresher`（任一窗口低≥10 才预切换，防 ping-pong）；④ BUG-004 新增 `preSwitchWeeklyPct=95` 与 rolling 90 分档、monthly 不再触发预切换。全量回归 `bug/regression/key-switch-sim.cjs` PASS=20 RED=0 exit=0（S1-S14 全绿）。`node --check` 通过，mock 模式启动/health/config/聊天链路正常。真实 E2E 待 ≥2 把健康 key。
+- 2026-08-22：生命周期验证——`go-guard.cjs` 尚未实现（README 标「下阶段」），当前网关手动启停，不跟随 ZCode；参考母本 `reference/dt-mcp-watch/dt-guard.cjs`（v3：SessionStart 钩子→spawn detached 自守护→PID 锁单例→每 5s 查 ZCode.exe→消失满 60s 停引擎收摊）存在，待按端口 8788 参数化创建 go-guard.cjs 并挂 SessionStart 钩子。
