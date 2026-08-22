@@ -65,6 +65,8 @@ else
 fi
 
 # ---- 3) 双推 + 回读 ----
+git -C "$PUB" fetch origin main --quiet
+git -C "$PUB" fetch gitcode main --quiet
 git -C "$PUB" push --force-with-lease origin main
 git -C "$PUB" push --force-with-lease gitcode main
 ORIGN=$(git -C "$PUB" ls-remote origin main | cut -f1)
