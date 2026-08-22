@@ -83,7 +83,7 @@ git -C "$PUB" fetch origin main --quiet
 git -C "$PUB" push --force-with-lease origin main
 
 git -C "$PUB" checkout -q -B gitcode-mirror main
-grep -rl -F -e "Duanzhoutao/opencode-go-router" --exclude-dir=.git "$PUB" 2>/dev/null | while read -r f; do
+grep -rl -F -e "Duanzhoutao/opencode-go-router" --exclude-dir=.git --exclude=publish.sh "$PUB" 2>/dev/null | while read -r f; do
   sed -i -f "$SEDF" "$f"
 done
 rm -f "$SEDF"
