@@ -121,6 +121,7 @@
         <label>预切换阈值 %（rolling/weekly/monthly 达此值提前迁移）<input type="number" id="cfgPre" min="0" max="100" step="1"></label>
         <label>每 Key 并发上限（1–8）<input type="number" id="cfgConc" min="1" max="8" step="1"></label>
         <label class="inline"><input type="checkbox" id="cfgSticky"> 启用 x-session-id 粘性</label>
+        <label class="inline"><input type="checkbox" id="cfgRetryEmpty"> 空回复重试优化（缓冲至首个正文；上游返回空流 → 零字节掐断 → 触发 ZCode 自动重发）</label>
         <label>本地访问 token（≥4 字符，留空清除；设置后转发面与控制面需 Bearer）<input type="password" id="cfgToken" autocomplete="off"></label>
         <button class="btn primary" type="submit">保存参数</button>
       </form>

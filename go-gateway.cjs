@@ -3,7 +3,7 @@
  * go-gateway.cjs — OpenCode Go 多 Key 本地路由网关（Phase 1 MVP）
  *
  * 本地单进程网关（默认 127.0.0.1:8788，Node 24 原生 http/https，零依赖）：
- *   - 转发面  POST /v1/chat/completions     （OpenAI 协议，SSE 透传 + 透明 failover）
+ *   - 转发面  POST /v1/chat/completions     （OpenAI 协议，SSE 透传 + 透明 failover + 空回复重试优化）
  *             GET  /v1/models              （模型列表透传，ZCode 启动探测思考能力，不可 404）
  *   - 控制面  /api/*                         （keys/sessions/events/status/config）
  *   - 静态    GET /                          （前端六视图，纯 HTML/CSS/JS）
@@ -78,6 +78,7 @@ function defaultState() {
       concurrencyPerKey: 5,           // 每 Key 并发上限
       localToken: null,               // 可选本地 token：设置后转发面与控制面要求 Bearer
       stickyEnabled: true,            // x-session-id 粘性开关
+      retryEmptyResponse: true,       // 空回复重试优化：识别上游空流→掐断连接→触发 ZCode 网络级自动重试
     },
     keys: [],
     sessions: [],
@@ -404,19 +405,98 @@ function finishRequest(key, sessionId, model, started, cacheTokens) {
   if (cacheTokens > 0) addEvent("cache-hit", key.id, `${model} cached=${cacheTokens}`);
 }
 
+// 流内异常完成检测（空回复重试优化）：上游 2xx 已开始流式，但收尾给出「空回复」——
+// 无正文/无工具调用，且 finish_reason 非正常值（如 other / 其它未知值）或流不完整（无 finish 无 [DONE]）。
+// 关键约束（实测 ZCode 行为）：一旦客户端已向用户输出过任何内容（思考也算），ZCode 就判定
+// retryable=false、不自动重试；只有「连接层就失败、零输出」才 retryable=true 自动重发。
+// 因此本实现在收到第一个正文/工具调用 chunk 之前**暂存整个流**（思考也暂存）：
+//   - 若最终是空回复 → 掐断连接且一个字节都不透传（客户端表现为连接层失败 → ZCode 自动重试）；
+//   - 若出现了正文/工具调用 → 把暂存的思考+正文一次性交还，之后转直通；
+//   - 合法 thinking-only 完成（finish=stop/[DONE]，只有思考没有正文）→ 按正常完成交还；
+//   仅当 retryEmptyResponse 打开时才缓存（关掉则完全透明直通）。
+// 副作用：思考不再实时滚动（正文出现时一并出现）；这是「零输出失败→可重试」的必然代价。
 function streamThrough(clientRes, upRes, key, sessionId, model, started) {
   clientRes.writeHead(upRes.statusCode, upRes.headers);
   let buf = "";
   let cacheTokens = 0;
+  let sawContent = false;      // 是否出现过正文（delta.content / delta.text）
+  let sawToolCalls = false;    // 是否出现过工具调用
+  let sawDone = false;         // 是否看到 data: [DONE]
+  let finishReason = null;     // 最后一个 finish_reason
+  let settled = false;         // finishRequest 只记一次账（abort 会 destroy 上游触发 error，需守卫防重复）
+  let flushed = false;         // 已进入直通模式（缓冲已冲刷）
+  const pending = [];          // 冲刷前暂存的原始 chunk
+  let pendingBytes = 0;
+  const MAX_PENDING = 512 * 1024; // 缓冲上限：超限降级直通（病态超长思考不撑爆内存）
+  const finishOnce = () => { if (settled) return; settled = true; finishRequest(key, sessionId, model, started, cacheTokens); };
+  const endClient = () => { try { clientRes.end(); } catch {} finishOnce(); };
+  const flushPending = () => {
+    for (const c of pending) { try { clientRes.write(c); } catch {} }
+    pending.length = 0; pendingBytes = 0; flushed = true;
+  };
+  const abortClient = (why) => {
+    addEvent("empty-stream", key.id, `model=${model} abort=${why} content=${sawContent} tools=${sawToolCalls} finish=${finishReason || "none"}`);
+    try { clientRes.destroy(); } catch {}
+    finishOnce();
+    try { upRes.destroy(); } catch {} // 提前释放上游；其 error 由 finishOnce 守卫，不重复记账
+  };
+  // 增量 SSE 解析：跨 chunk 拼接，按 \n\n 切事件，提取正文/工具调用/finish_reason/[DONE]
+  let sse = "";
+  const scan = (text) => {
+    sse += text;
+    let idx;
+    while ((idx = sse.indexOf("\n\n")) >= 0) {
+      const block = sse.slice(0, idx); sse = sse.slice(idx + 2);
+      for (const line of block.split(/\r?\n/)) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") { sawDone = true; continue; }
+        let ev; try { ev = JSON.parse(data); } catch { continue; }
+        const ch = ev.choices && ev.choices[0];
+        if (!ch) continue;
+        const d = ch.delta || {};
+        if (d.content || d.text) sawContent = true;
+        if (d.tool_calls && d.tool_calls.length) sawToolCalls = true;
+        if (ch.finish_reason) finishReason = ch.finish_reason;
+      }
+    }
+    if (sse.length > 65536) sse = sse.slice(-16384);
+  };
+  const abnormalFinish = () => finishReason && !["stop", "tool_calls", "length", "content_filter"].includes(finishReason);
+  const enabled = () => state.config.retryEmptyResponse !== false;
+  const emptySoFar = () => !sawContent && !sawToolCalls;
   upRes.on("data", (chunk) => {
-    buf += chunk.toString("utf8");
+    const text = chunk.toString("utf8");
+    buf += text;
+    scan(text);
     const m = buf.match(/"cached_tokens"\s*:\s*(\d+)/);
     if (m) cacheTokens = Math.max(cacheTokens, parseInt(m[1], 10));
     if (buf.length > 65536) buf = buf.slice(-16384);
+    if (!flushed && enabled()) {
+      // 缓冲阶段：空回复签名出现（无正文/工具 + 非正常 finish）→ 零字节掐断
+      if (emptySoFar() && abnormalFinish()) { abortClient("empty-buffer"); return; }
+      // 出现真实内容/工具调用 → 冲刷暂存（含思考），本次 chunk 一并交还，进入直通
+      if (!emptySoFar()) { flushPending(); }
+      // 缓冲超限 → 降级直通，避免病态超长思考撑爆内存
+      else if (pendingBytes > MAX_PENDING) { flushPending(); }
+      if (!flushed) { pending.push(chunk); pendingBytes += chunk.length; return; }
+    }
     clientRes.write(chunk);
   });
-  upRes.on("end", () => { try { clientRes.end(); } catch {} finishRequest(key, sessionId, model, started, cacheTokens); });
-  upRes.on("error", () => { try { clientRes.destroy(); } catch {} finishRequest(key, sessionId, model, started, cacheTokens); });
+  upRes.on("end", () => {
+    if (settled) return; // 已因空回复掐断，不再补正常收尾
+    if (!flushed && enabled()) {
+      // 从未进入直通：整条流都在缓冲里。无正文/工具 且（非正常 finish 或 流不完整）→ 零字节掐断；否则（合法完成，如 thinking-only）交还
+      if (emptySoFar() && (abnormalFinish() || (!finishReason && !sawDone))) { abortClient("empty-buffer"); return; }
+      flushPending();
+    }
+    endClient();
+  });
+  upRes.on("error", () => {
+    // 上游中途断连：缓冲阶段（零输出）→ 掐断 = 连接层失败 = 客户端可重试；已直通 → 掐断（原有行为）
+    try { clientRes.destroy(); } catch {}
+    finishOnce();
+  });
 }
 
 // 首字节前失败后的统一兜底（BUG-002/005/006）：
@@ -809,6 +889,7 @@ async function handlePatchConfig(req, res) {
   if (typeof body.preSwitchWeeklyPct === "number" && body.preSwitchWeeklyPct >= 0 && body.preSwitchWeeklyPct <= 100) c.preSwitchWeeklyPct = body.preSwitchWeeklyPct;
   if (typeof body.concurrencyPerKey === "number" && body.concurrencyPerKey >= 1 && body.concurrencyPerKey <= 8) c.concurrencyPerKey = body.concurrencyPerKey;
   if (typeof body.stickyEnabled === "boolean") c.stickyEnabled = body.stickyEnabled;
+  if (typeof body.retryEmptyResponse === "boolean") c.retryEmptyResponse = body.retryEmptyResponse;
   if (typeof body.localToken === "string" && body.localToken.length >= 4) c.localToken = body.localToken;
   if (body.localToken === "") c.localToken = null;
   addEvent("config", null, "runtime config updated");
@@ -882,12 +963,17 @@ if (!MOCK) {
   log(`gateway MOCK_MODE, state=${STATE_FILE}, keys=${state.keys.length}`);
 }
 
-server.on("error", (e) => { if (e.code === "EADDRINUSE") log("FATAL: port " + PORT + " already in use"); else log("server error: " + e.message); process.exit(1); });
-server.listen(PORT, "127.0.0.1", () => {
-  log(`OpenCode Go gateway v${VERSION} listening on http://127.0.0.1:${PORT} (mode=${MOCK ? "mock" : "real"})`);
-  if (!MOCK) schedulePoll();
-});
+// 自测钩子：GO_NO_LISTEN=1 时跳过启动，仅导出 streamThrough 供单测驱动（不影响正常启动路径）
+if (process.env.GO_NO_LISTEN === "1") {
+  module.exports = { streamThrough, config: state.config, state };
+} else {
+  server.on("error", (e) => { if (e.code === "EADDRINUSE") log("FATAL: port " + PORT + " already in use"); else log("server error: " + e.message); process.exit(1); });
+  server.listen(PORT, "127.0.0.1", () => {
+    log(`OpenCode Go gateway v${VERSION} listening on http://127.0.0.1:${PORT} (mode=${MOCK ? "mock" : "real"})`);
+    if (!MOCK) schedulePoll();
+  });
 
-for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, () => { saveState(); log("shutdown"); process.exit(0); });
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.on(sig, () => { saveState(); log("shutdown"); process.exit(0); });
+  }
 }

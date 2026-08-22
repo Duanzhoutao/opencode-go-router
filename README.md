@@ -20,6 +20,7 @@ OpenCode Go 订阅的每个 Key 有 **5 小时滚动 / 每周 / 每月** 三重�
 - **会话粘性（`x-session-id`）**：同一会话永远走同一 Key，模型上下文缓存不因轮换失效；跨会话自动分配到不同 Key。
 - **限额感知调度**：每 15 分钟轮询 `/usage` 三窗口用量（5h 滚动 / 周 / 月，含 `resetsAt`），按「周剩余最多」优先出 Key；窗口将尽（可配置阈值）提前迁移到富余 Key；月限用尽的 Key 自动隔离，月窗重置后自动复活。
 - **透明 failover**：上游 429/5xx 时缓冲首字节后自动换下一个可用 Key（failoverChain 兜底），对客户端无感知。
+- **空回复重试优化（`retryEmptyResponse`，默认开）**：部分模型端（如 `deepseek-v4-flash-vision-exp`）在长思考后偶发「空回复」——`finish_reason=other` 或直接断流、零正文，客户端会收到空响应且通常不自动重试。网关在收到第一个正文/工具调用前缓冲整条流：若最终是空回复，**零字节**掐断连接，让客户端表现为「连接层失败」并按其网络重试机制自动重发；正常出正文则按序交还思考+正文后直通。已知取舍：缓冲期间思考内容不实时滚动（正文出现时一并显示）；「正文中途截断」不在覆盖范围（改回直通原样透传）。可在设置页关闭后完全透明直通。
 - **同池检测**：从 429 响应 metadata 提取 workspace id，同 workspace 的 Key 标记「同池」并告警——提示轮换它们无效。
 - **状态机管理**：`active / cooldown_rolling / cooldown_weekly / quarantined / invalid` 五态 + 冷却截止时间，支持手动停用、删除、复活、隔离。
 - **浏览器仪表盘**：六视图单页（总览 / Key 管理 / 隔离区 / 会话绑定 / 事件日志 / 设置），暖棕奶油白主题、原生控件主题化、用量进度条三档分色（绿 <90% / 金 ≥90% / 红 ≥100%）。
@@ -151,6 +152,7 @@ curl -s http://127.0.0.1:8788/v1/chat/completions \
 | `preSwitchWeeklyPct` | `95` | 0–100（周窗口预切换阈值 %） |
 | `concurrencyPerKey` | `5` | 1–8 |
 | `stickyEnabled` | `true` | bool（关掉后粘性按请求重新选 Key） |
+| `retryEmptyResponse` | `true` | bool（空回复重试优化，默认开；关闭后完全透明直通） |
 | `localToken` | `null` | 字符串 ≥4 字符；设空字符串清除 |
 
 ## 环境变量
@@ -189,7 +191,6 @@ GO_PORT=9000 GO_LOG=~/go.log node go-gateway.cjs
 ├── go-gateway.cjs               # 网关本体（转发 + 调度 + 状态机 + 控制面 API + 静态托管，零依赖）
 ├── go-guard.cjs                 # 生命周期守护（可选，跟随 ZCode 启停）
 ├── ui/                          # 仪表盘单页（index.html / app.js / style.css，纯原生）
-├── bug/                         # Bug 台账与回归脚本（key-switch-sim.cjs、go-guard-verify.sh）
 ├── docs/
 │   ├── plans/                   # 设计决策文档（主方案 / 实测证据 / UI 架构）
 │   └── reports/                 # 历史调研

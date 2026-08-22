@@ -232,7 +232,7 @@ function renderSessions() {
     : `<tr><td colspan="5" style="color:var(--muted)">暂无会话绑定——ZCode 发起请求后会自动绑定到 Key。</td></tr>`;
 }
 
-const EV_TYPES = ["bind", "migrate", "enroll", "cooldown", "rate-limited", "failover", "quarantine", "recover", "reactivate", "invalid", "exhausted", "cache-hit", "same-workspace-alert", "upstream-5xx", "delete", "edit", "config", "refresh"];
+const EV_TYPES = ["bind", "migrate", "enroll", "cooldown", "rate-limited", "failover", "quarantine", "recover", "reactivate", "invalid", "exhausted", "cache-hit", "same-workspace-alert", "upstream-5xx", "empty-stream", "delete", "edit", "config", "refresh"];
 
 function renderEvents() {
   const sel = $("#evType");
@@ -262,6 +262,7 @@ function renderSettings() {
   $("#cfgPre").value = c.preSwitchPct ?? 90;
   $("#cfgConc").value = c.concurrencyPerKey ?? 5;
   $("#cfgSticky").checked = c.stickyEnabled !== false;
+  $("#cfgRetryEmpty").checked = c.retryEmptyResponse !== false;
   $("#cfgToken").value = "";
 
   $("#zcodeGuide").textContent =
@@ -392,6 +393,7 @@ async function saveConfig(e) {
     preSwitchPct: Number($("#cfgPre").value) || 90,
     concurrencyPerKey: Number($("#cfgConc").value) || 5,
     stickyEnabled: $("#cfgSticky").checked,
+    retryEmptyResponse: $("#cfgRetryEmpty").checked,
   };
   const tok = $("#cfgToken").value.trim();
   if (tok) body.localToken = tok; else body.localToken = "";
