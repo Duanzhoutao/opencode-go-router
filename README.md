@@ -27,6 +27,7 @@
 | `docs/plans/opencode-go-key-router-2026-08-22.md` | **主方案（唯一决策源）**：问题 P1-P9 / 核心逻辑 L1-L8 / 解决方案（架构·文件布局·ZCode 对接·选型·分期）+ §3.6 待确认决策点 4 个 + §3.7 开放项 V1-V6 与已接受风险 |
 | `docs/plans/opencode-go-router-evidence-2026-08-22.md` | 实测证据链（外挂）：API 实测（/usage、429、401、/models）、asar 反编译、model-io 日志验证、dt-guard 模式实证、缓存调研、参考项目、复现命令 |
 | `docs/reports/opencodego-claude-code-feasibility-2026-08-04.md` | 历史可行性调研（2026-08-04）：Claude Code 接入 Go 套餐的端点/协议/参考代理 |
+| `docs/plans/opencode-go-router-ui-architecture-2026-08-22.md` | 设计细化（UI/后端规格）：前端功能清单（六视图本地单页）+ 后端架构（模块/控制面 API 契约/存储 schema/数据流）+ 真实探测结果 + MOCK_MODE 模拟方案 |
 
 > ⚠️ 开工前必读：主方案 `docs/plans/opencode-go-key-router-2026-08-22.md` 的 **§3.6 待用户确认的 4 个决策点**（多 Key 是否独立 workspace / 排序方向 / 储备策略 / 每 Key 并发上限）与 **§3.7 开放项 V1-V6**（failover 端到端 / 缓存实测 / 同池检测 / 子智能体 header / rolling resetsAt 语义 / /usage 稳定性）需用户确认或实现后实证。
 

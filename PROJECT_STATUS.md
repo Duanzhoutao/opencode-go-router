@@ -8,6 +8,8 @@
 
 ## 详细日志（近期，最近在上）
 
+- 2026-08-22（细节敲定轮）：**前端功能清单 + 后端架构设计细化**。产出 `docs/plans/opencode-go-router-ui-architecture-2026-08-22.md`：前端定为本地单页网页（六视图：总览/Key 管理/隔离区/会话绑定/事件日志/设置，纯 HTML/CSS/JS 无构建链）；后端定为单 Node 进程网关（转发面+控制面 API+静态托管同进程），列出控制面 API 端点契约、keys.json schema、请求/定时两条数据流，并设计 MOCK_MODE 供开发期模拟 debug。本轮真实探测（ZCode config `ce6a858a` Go Key）：/usage 三窗口数据形状确认（当前 rolling 0% / weekly 100% 周一重置 / monthly 50%）、429 预流式 JSON 确认（limitName=weekly、Retry-After 153435、metadata.workspace=wrk_01KKZMHM676M3CWS8ZDFJ75EFG）；**新发现：裸 urllib 请求被 Cloudflare 1010 拦截、带浏览器 UA 的 curl 通过 → 网关转发必须处理 UA（实现第一件事验证）**。参考 opencode-go-dashboard（多账号 CRUD/一键刷新/上限高亮，但用 Auth Cookie 抓页面）与 pi-opencode-go-rotation（后端轮换逻辑无 UI）。主方案 §3.6 决策点与 §3.7 V1-V6 仍待确认/实证。
+
 - 2026-08-22：**项目独立化引导 + 核心文档迁移（从 Me 工作区）**。在 `D:\develop\Trae\OpencodeGo` 建立项目骨架（README/AGENTS/PROJECT_STATUS/.gitignore/docs/reference/project-context），迁移设计文档：主方案 `docs/plans/opencode-go-key-router-2026-08-22.md`、证据链 `docs/plans/opencode-go-router-evidence-2026-08-22.md`、历史可行性报告 `docs/reports/opencodego-claude-code-feasibility-2026-08-04.md`、生命周期守护参考实现 `reference/dt-mcp-watch/`（dt-guard.cjs + README，go-guard.cjs 母本）。迁移时仅做明显过时路径修正（主方案 §3.2 布局前缀、dt-guard 引用路径），内容不改写。Me 侧原文件保持原样，本工作区成为设计唯一归属地。吸收 4 条核心事实进本项目管理记忆。迁移报告：`%TEMP%\zcode\opencode-go-router-bootstrap\handoff-report.md`。
 
 ## 重要约束
