@@ -82,37 +82,70 @@ body {
 }
 
 /* ---- 底部波浪（实心） ---- */
-/* ---- 底部：俯瞰大海的斜向流光波浪 ---- */
+/* ---- 底部：俯瞰大海的斜向流光波浪（借鉴多层渐变叠加 + 斜向渐变流动的开源手法）---- */
 .sea {
-  position: fixed; bottom: 0; left: 0; width: 100%; height: 260px; z-index: 0;
+  position: fixed; bottom: 0; left: 0; width: 100%; height: 320px; z-index: 0;
   pointer-events: none; overflow: hidden;
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.35) 16%, #000 55%);
-          mask-image: linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.35) 16%, #000 55%);
+  /* 海面基底：底部深琥珀色，向上渐透（像整片海而不是空白上的几条带） */
+  background:
+    radial-gradient(120% 90% at 50% 112%, rgba(120,72,26,0.32) 0%, rgba(140,92,42,0.16) 46%, rgba(190,142,82,0.06) 72%, transparent 92%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.35) 20%, #000 55%);
+          mask-image: linear-gradient(to bottom, transparent 0%, rgba(0,0,0,0.35) 20%, #000 55%);
 }
+/* 斜向细密波光（波光粼粼，两层不同角度/周期叠加出丰富层次） */
+.sea::before, .sea::after {
+  content: ""; position: absolute; top: -18%; left: -40%; width: 180%; height: 140%;
+}
+.sea::before {
+  background: repeating-linear-gradient(
+    108deg,
+    transparent 0 54px,
+    rgba(255,255,255,0.10) 54px 57px,
+    transparent 57px 112px,
+    rgba(240,192,124,0.16) 112px 116px,
+    transparent 116px 170px
+  );
+  animation: seaFlow 18s linear infinite;
+}
+.sea::after {
+  top: 4%;
+  background: repeating-linear-gradient(
+    74deg,
+    transparent 0 80px,
+    rgba(255,255,255,0.12) 80px 83px,
+    transparent 83px 160px
+  );
+  animation: seaFlow 26s linear infinite reverse;
+}
+@keyframes seaFlow {
+  to { transform: translate3d(72px, 24px, 0); }
+}
+/* 主波浪亮线（一两道接近对角线的波峰反光，流光溢彩） */
 .sea-band {
-  position: absolute; left: -18%; width: 136%; height: 120px;
-  overflow: hidden; border-radius: 999px;
+  position: absolute; left: -18%; width: 136%; height: 5px; border-radius: 99px;
   background: linear-gradient(90deg,
-    rgba(154,92,24,0) 0%,
-    rgba(190,120,40,0.26) 26%,
-    rgba(232,165,74,0.44) 50%,
-    rgba(190,120,40,0.22) 74%,
-    rgba(154,92,24,0) 100%);
+    transparent 6%,
+    rgba(255,238,210,0.75) 30%,
+    rgba(255,244,226,0.95) 50%,
+    rgba(255,238,210,0.65) 70%,
+    transparent 94%);
+  box-shadow: 0 0 14px rgba(255,222,174,0.55);
+  overflow: hidden;
 }
 .sea-band::after {
-  content: ""; position: absolute; inset: 0;
-  background: linear-gradient(100deg, transparent 42%, rgba(255,255,255,0.6) 50%, transparent 58%);
+  content: ""; position: absolute; inset: -6px 0;
+  background: linear-gradient(100deg, transparent 40%, rgba(255,255,255,0.95) 50%, transparent 60%);
   background-size: 220% 100%;
-  animation: bandFlow 8s linear infinite;
+  animation: bandFlow 6s linear infinite;
 }
 @keyframes bandFlow {
   from { background-position: 130% 0; }
   to { background-position: -130% 0; }
 }
-.band-1 { top: -36px; height: 150px; transform: rotate(5deg);   opacity: 0.5;  animation-duration: 12s; }
-.band-2 { top: 46px;  height: 132px; transform: rotate(-15deg); opacity: 0.85; animation-duration: 8s; }
-.band-3 { top: 128px; height: 126px; transform: rotate(-15deg); opacity: 0.6;  animation-duration: 11s; animation-direction: reverse; }
-.band-4 { top: 210px; height: 150px; transform: rotate(8deg);   opacity: 0.55; animation-duration: 14s; }
+.band-1 { top: 78px;  height: 5px; transform: rotate(-15deg); opacity: 0.85; }
+.band-2 { top: 150px; height: 4px; transform: rotate(9deg);   opacity: 0.7;  animation-duration: 8s; animation-direction: reverse; }
+.band-3 { top: 222px; height: 6px; transform: rotate(-12deg); opacity: 0.8;  animation-duration: 7s; }
+.band-4 { top: 296px; height: 7px; transform: rotate(6deg);   opacity: 0.9;  animation-duration: 9s; }
 
 /* ---- 顶栏 ---- */
 .topbar {
