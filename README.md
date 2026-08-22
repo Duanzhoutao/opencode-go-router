@@ -28,6 +28,8 @@
 | `docs/plans/opencode-go-router-evidence-2026-08-22.md` | 实测证据链（外挂）：API 实测（/usage、429、401、/models）、asar 反编译、model-io 日志验证、dt-guard 模式实证、缓存调研、参考项目、复现命令 |
 | `docs/reports/opencodego-claude-code-feasibility-2026-08-04.md` | 历史可行性调研（2026-08-04）：Claude Code 接入 Go 套餐的端点/协议/参考代理 |
 | `docs/plans/opencode-go-router-ui-architecture-2026-08-22.md` | 设计细化（UI/后端规格）：前端功能清单（六视图本地单页）+ 后端架构（模块/控制面 API 契约/存储 schema/数据流）+ 真实探测结果 + MOCK_MODE 模拟方案 |
+| `docs/plans/opencode-go-router-implementation-plan-2026-08-22.md` | 实施细节计划（敲定版）：技能使用清单、内置浏览器测试方案、ZCode 模型配置真实接入测试步骤、实现顺序、验收标准 |
+| `docs/plans/opencode-go-router-goal-prompt-2026-08-22.md` | 目标提示词（Goal-Mode）：可直接设定为持续执行目标，指导 MVP 实现与真实跑通 |
 
 > ⚠️ 开工前必读：主方案 `docs/plans/opencode-go-key-router-2026-08-22.md` 的 **§3.6 待用户确认的 4 个决策点**（多 Key 是否独立 workspace / 排序方向 / 储备策略 / 每 Key 并发上限）与 **§3.7 开放项 V1-V6**（failover 端到端 / 缓存实测 / 同池检测 / 子智能体 header / rolling resetsAt 语义 / /usage 稳定性）需用户确认或实现后实证。
 
