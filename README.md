@@ -33,6 +33,17 @@
 
 > ⚠️ 开工前必读：主方案 `docs/plans/opencode-go-key-router-2026-08-22.md` 的 **§3.6 待用户确认的 4 个决策点**（多 Key 是否独立 workspace / 排序方向 / 储备策略 / 每 Key 并发上限）与 **§3.7 开放项 V1-V6**（failover 端到端 / 缓存实测 / 同池检测 / 子智能体 header / rolling resetsAt 语义 / /usage 稳定性）需用户确认或实现后实证。
 
+## 已知风险与待验证点（排查入口）
+
+> 以后遇到「网关表现异常 / 模型表现怪 / 质量不对」先看这张表，按「位置」列点进详细文档。
+
+| 风险 / 待验证 | 结论或状态 | 位置 |
+|---|---|---|
+| **思考透传**：ZCode 自动探测模型思考档位并带 thinking/output_config 参数，opencode.ai 返回 reasoning_content 思考流。网关是透明转发层、设计上不影响质量；但 **/models 必须一致转发**（否则 ZCode 思考档位探测变→才真影响质量）、thinking 参数不得剥离、reasoning_content 流不得破坏 | 设计结论已定，待真实接入测试闭环 | `docs/plans/opencode-go-router-ui-architecture-2026-08-22.md` §1.4；验收项 `docs/plans/opencode-go-router-implementation-plan-2026-08-22.md` §三.9 |
+| 出站 UA 被 Cloudflare 1010 拦（裸 urllib 403，带浏览器 UA 通过） | 已实测，实现时第一个验证点 | UI 架构 §1.3 |
+| 真实多 Key failover（V1）端到端 | 需 ≥2 把健康 Key 才能实证 | 主方案 §3.7 |
+| /usage 端点稳定性（V6） | 长期观察 | 主方案 §3.7 |
+
 ## 目录结构
 
 ```text

@@ -40,6 +40,17 @@
 - 带浏览器 UA 的 `curl` 全部通过（200/429 正常）。
 - **对网关的工程含义**：出站请求的 User-Agent 不能是 Node 默认/无 UA——**实现 Phase 1 的第一件事**就是用真实 Key 验证网关转发（node http/fetch）带什么 UA 能通过；ZCode 本身能连通（其 HTTP 栈 UA 可过），网关照 ZCode 的 UA 形态配即可。
 
+### 1.4 网关透明性与思考（thinking/reasoning）透传（风险点）
+
+**问题**：ZCode 会自动探测模型的思考档位并在请求里带 `thinking` / `output_config` 参数；opencode.ai 的 SSE 流会返回思考过程（DeepSeek 走 `delta.reasoning_content`）。网关在中间转发，会不会影响模型质量？
+
+**结论（设计上）**：**不影响**。网关是纯透明转发层——请求体原样转发、响应流原样透传，不改写 thinking/effort 字段、不解析重组响应。思考在模型侧完成，决定质量的是「上游模型 + ZCode 发出的 thinking/effort 档位」，这两者网关都不碰；思考内容返不返回客户端只影响「界面是否显示思考过程」，不影响最终 `delta.content`。因此输出与 ZCode 直连 opencode.ai 一致。
+
+**三个真实风险点（需实测闭环）**：
+1. **`/models` 探测**：ZCode 构造 provider / 判断模型思考能力时可能调 `GET /v1/models`（公开无鉴权、28 模型）。baseURL 指向网关后，**网关必须正确转发 `/models` 或返回一致列表**，否则 ZCode 对模型思考档位的探测会变、可能不发 thinking 参数——这才真正影响质量。→ **规格：转发面除 `/v1/chat/completions` 外必须支持 `GET /v1/models`（原样转发或静态返回同一列表）**。
+2. **参数透传完整性**：转发时不得剥离/改写请求体的 `thinking`、`output_config.effort`、`budget_tokens` 等字段（MVP 直通天然满足，防止实现时顺手「整理」请求体）。
+3. **出站 UA**：见 §1.3（Cloudflare 1010）。
+
 ---
 
 ## 二、前端功能清单（本地单页网页）
