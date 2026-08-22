@@ -1,0 +1,23 @@
+# 运行态 / 缓存 / 依赖
+node_modules/
+*.log
+*.exe
+__pycache__/
+
+# 密钥文件（真实 Key 只存运行时，不入库）
+keys.json
+
+# 编辑器 / 应用本地状态
+.zcode/
+.claude/
+.codex/
+.vscode/
+.workbuddy/
+.snapshots/
+.playwright-cli/
+.tmp/
+.inbox/
+
+# 临时产物
+*.tmp
+*.bak
