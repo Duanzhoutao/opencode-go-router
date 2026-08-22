@@ -4,9 +4,11 @@
 
 ## 当前目标（进行中）
 
-- 项目引导 + 核心文档迁移完成（本任务）。设计定稿，**网关代码未实现**；待用户确认主方案 `docs/plans/opencode-go-key-router-2026-08-22.md` §3.6 的 4 个决策点后进入 MVP 实现（实现由后续任务另行提供 skill）。
+- Phase 1 MVP 已实现并真实跑通（go-gateway.cjs + ui/ 六视图）；待用户提供 ≥2 健康 Key 做 V1 端到端 failover 验证；下阶段可接 go-guard 生命周期。主方案 §3.6 的 4 个决策点仍按默认推进。
 
 ## 详细日志（近期，最近在上）
+
+- 2026-08-22（Phase 1 MVP 实现轮）：**go-gateway.cjs + 前端六视图实现并真实跑通**。① 网关（Node 24 原生 http/https，零依赖）：转发面 `POST /v1/chat/completions`（x-session-id 粘性、周剩余优先、缓冲首字节 failover、SSE 透传、429 metadata 解析）+ `GET /v1/models`（透传 29 模型，ZCode 探测思考能力，侧边对话风险补充后补上）；控制面 `/api/*`（keys CRUD/refresh/reactivate/quarantine、sessions、events、status、config）；状态机 active/cooldown_rolling/cooldown_weekly/quarantined/invalid；/usage 主动轮询 + 429 被动；MOCK_MODE（GO_STATE_DIR 可隔离）。② 前端 `ui/`（纯 HTML/CSS/JS 无构建链）：六视图（总览/Key 管理/隔离区/会话绑定/事件日志/设置），浅色玻璃质感主题（奶油白偏棕 + backdrop-filter 磨砂 + 琥珀/翠绿高饱和点缀 + 底部双层波浪流动 + 衬线标题 + 进度条流光）。③ 第一技术验证点：Node https 出站 TLS 通过 Cloudflare（urllib 被 1010 拦，node 正常，无需特殊 UA）。④ 修真实 bug：429 的 metadata 在顶层而非 error.metadata（证据文档示例位置与实际不符），已兼容两种位置 + 修复 cooldown 迁移；无 active Key 时按 L4 如实回 429 + 恢复时间而非 503。⑤ 真实链路：用 ZCode config 的 Go Key 录入，/usage 三窗口正确（weekly 100% 周一 00:00 UTC 重置 / monthly 50%），经网关带 x-session-id 转发返回上游原始 429（workspace wrk_01KKZMHM… 回填），事件日志记录 bind/rate-limited/cooldown/exhausted。⑥ ZCode 模型配置真实测试：备份 config.json，ce6a858a 的 baseURL 改 `http://127.0.0.1:8788/v1`、apiKey 改占位符，新增 disabled 逃生门 opencodego-direct；用与 config 改动后完全一致的请求（Bearer sk-local-gateway + x-session-id）经网关验证通过，结论「能这样用」。⑦ 内置浏览器 IAB 逐视图截图验证（MOCK 全状态 + 真实看板），无乱码、对比度正常。真实 Key 仅存 keys.json（gitignore）。备份 `%TEMP%\zcode\opencode-go-router-bootstrap\config.json.bak-*`。待办：≥2 健康 Key 的 V1 failover 端到端、go-guard 生命周期（下阶段）。
 
 - 2026-08-22（侧边对话·风险补充）：**网关透明性与思考透传风险点落盘**。结论：网关是纯透明转发层，思考在模型侧完成、决定质量的是上游模型 + ZCode 发出的 thinking/effort 档位，设计上不影响模型质量；三个真实风险点：① ZCode 可能调 `/models` 探测思考能力 → **网关必须一致转发 /models**（否则思考档位探测变→才真影响质量，转发面规格新增 `GET /v1/models`）；② 转发不得剥离 thinking/output_config/budget_tokens 字段；③ 出站 UA（Cloudflare 1010，已有）。已写入 UI 架构 §1.4、实施计划 §三.9（验收检查项）/§六（风险）、README「已知风险与待验证点」清单。
 

@@ -59,16 +59,32 @@
 │   └── dt-mcp-watch/                # 生命周期守护参考实现（go-guard.cjs 母本）
 │       ├── dt-guard.cjs
 │       └── README.md                # 部署/复现/回退手册（含 v1/v2/v3 决策记录）
-├── project-context/                 # 归档：status-NNN-YYYYMMDD.md
-└── [未来网关代码位于项目根]            # go-gateway.cjs / go-guard.cjs / keys.json / 部署 README
+├── go-gateway.cjs                   # 网关本体（转发/调度/状态机/控制面 API/静态前端）
+├── ui/                              # 前端六视图（index.html / app.js / style.css，纯原生）
+├── keys.json                        # 运行态：Key/状态/会话绑定（0600，已 gitignore，不入库）
+└── project-context/                 # 归档：status-NNN-YYYYMMDD.md
 ```
 
-### 未来网关代码位置（按主方案 §3.2 修正后约定）
+### 网关代码现状（Phase 1 MVP 已实现）
 
-- `go-gateway.cjs`：网关本体（转发/调度/状态机/控制面 API/静态前端，暴露 `/health`）。
-- `go-guard.cjs`：生命周期守护（照抄 `reference/dt-mcp-watch/dt-guard.cjs` 参数化，端口 8788，锁/日志在 `~/.opencode-go-router/`）。
-- `keys.json`：Key、状态、冷却截止、隔离记录、会话绑定表（0600，**真实 Key 不入库**，已入 `.gitignore`）。
-- 部署 `README.md`：照 `reference/dt-mcp-watch/README.md` 结构。
+- `go-gateway.cjs`：网关本体（Node 24 原生 http/https，零依赖），含转发面 `/v1/chat/completions`（x-session-id 粘性 + 缓冲首字节 failover + SSE 透传 + 429 metadata 解析）、控制面 `/api/*`（keys/sessions/events/status/config）、状态机（active/cooldown_rolling/cooldown_weekly/quarantined/invalid）、/usage 轮询、MOCK_MODE、静态前端托管。
+- `ui/`：六视图本地单页（总览/Key 管理/隔离区/会话绑定/事件日志/设置），浅色玻璃质感主题（奶油白偏棕 + backdrop-filter 磨砂 + 琥珀/翠绿高饱和点缀 + 底部波浪流水 + 衬线标题）。
+- `keys.json`：Key、状态、冷却截止、隔离记录、会话绑定表（运行态，**真实 Key 不入库**，已入 `.gitignore`）。
+- `go-guard.cjs`：生命周期守护（下阶段，照抄 `reference/dt-mcp-watch/dt-guard.cjs`，端口 8788）。
+
+## 运行
+
+```bash
+# 真实模式（需先在前端录入真实 Go Key，或启动后用 POST /api/keys）
+node go-gateway.cjs
+
+# MOCK_MODE（合成数据，不连真实端点，前端开发/演示用；可用 GO_STATE_DIR 指向临时目录保护真实 keys.json）
+MOCK_MODE=1 GO_STATE_DIR=/tmp/mockstate node go-gateway.cjs
+```
+
+启动后浏览器打开 `http://127.0.0.1:8788`。环境变量：`GO_PORT`（默认 8788）、`GO_LOG`（日志文件）、`GO_STATE_DIR`（状态目录）、`MOCK_MODE=1`。
+
+ZCode 对接（一次性）：`C:\Users\duanz\.zcode\v2\config.json` 的 OpencodeGo provider `ce6a858a` 把 `options.baseURL` 改为 `http://127.0.0.1:8788/v1`、`apiKey` 改占位符；另保留一个 disabled 的直连逃生门 provider。
 
 ## 已知跨工作区引用（不随本项目迁移）
 
