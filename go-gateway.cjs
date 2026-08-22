@@ -73,17 +73,26 @@ function defaultState() {
     updatedAt: new Date().toISOString(),
     config: {
       pollIntervalMs: 15 * 60 * 1000, // /usage 主动轮询默认 15min
-      preSwitchPct: 90,               // 预切换阈值：rolling 5h 窗口 ≥ 此值提前迁移
-      preSwitchWeeklyPct: 95,         // 预切换阈值：weekly 周窗口 ≥ 此值提前迁移（与 rolling 分档，BUG-004）
       concurrencyPerKey: 5,           // 每 Key 并发上限
       localToken: null,               // 可选本地 token：设置后转发面与控制面要求 Bearer
       stickyEnabled: true,            // x-session-id 粘性开关
       retryEmptyResponse: true,       // 空回复重试优化：识别上游空流→掐断连接→触发 ZCode 网络级自动重试
+      fallback: {                     // 备用通道（通用 OpenAI 协议上游，字段全部前端可配）
+        enabled: false,
+        label: "官方 DeepSeek",
+        baseURL: "",                  // 留空回退 DeepSeek 官方默认（FALLBACK_DEFAULT_BASE）
+        apiKey: null,                 // 前端填写保存；GET /api/config 掩码 "(set)"
+        model: "deepseek-v4-flash-vision-exp", // 兜底时一律改写为该模型
+        billingMode: "balance",       // balance=DeepSeek 官方 /user/balance 自动计费 | none=不计费
+        balanceSampleMs: 15 * 60 * 1000,
+      },
     },
     keys: [],
     sessions: [],
     events: [],
     seq: 0,
+    // 备用通道运行态（持久化，支持关网关补结算）
+    fallbackState: { sessionStart: null, samples: [], costs: [], settlements: [], lastFallbackAt: null, lastSampleAt: 0 },
   };
 }
 let state = defaultState();
@@ -92,10 +101,21 @@ function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
       const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      state = { ...defaultState(), ...raw, config: { ...defaultState().config, ...(raw.config || {}) } };
+      const d = defaultState();
+      state = {
+        ...d, ...raw,
+        config: { ...d.config, ...(raw.config || {}), fallback: { ...d.config.fallback, ...((raw.config || {}).fallback || {}) } },
+        fallbackState: { ...d.fallbackState, ...(raw.fallbackState || {}) },
+      };
+      // 迁移清理：旧版持久化的预切换配置（90% 预切换已整体移除）不再回显
+      delete state.config.preSwitchPct;
+      delete state.config.preSwitchWeeklyPct;
       if (!Array.isArray(state.keys)) state.keys = [];
       if (!Array.isArray(state.sessions)) state.sessions = [];
       if (!Array.isArray(state.events)) state.events = [];
+      if (!Array.isArray(state.fallbackState.samples)) state.fallbackState.samples = [];
+      if (!Array.isArray(state.fallbackState.costs)) state.fallbackState.costs = [];
+      if (!Array.isArray(state.fallbackState.settlements)) state.fallbackState.settlements = [];
     }
   } catch (e) { log("state load failed: " + e.message); }
 }
@@ -204,6 +224,29 @@ function runStateMachine(key) {
   }
 }
 
+// ---------------- 隔离区复活（L6 增强：月限 Key 自动复查 + 一键查询，共用同一恢复门禁） ----------------
+// 自动复查的「到点」判定：仅月限隔离（reason="monthly"）且已过续费日+ε 的 Key 才值得查 /usage。
+// 无 resetsAt（一次性套餐）不自动复查；已判废弃（monthly_dead）/手动停用/认证失效 也不自动复查。
+function quarantineDueForCheck(key, now = Date.now()) {
+  if (key.status !== "quarantined" || key.quarantineReason !== "monthly") return false;
+  const m = key.quota && key.quota.monthly;
+  if (!m || !m.resetsAt) return false;
+  return now >= new Date(m.resetsAt).getTime() + REVIVE_EPSILON_MS;
+}
+
+// 恢复门禁（手动 reactivate / reactivate-all「一键查询」/ 自动复查共用）：
+// monthly.status==="ok" 才回池；回池后补跑状态机，让同时受限的 weekly/rolling 直接进入冷却，
+// 避免「回池 → 第一个请求白吃一个 429」再被 failover 打下来。
+function activateFromUsage(key, usage, via) {
+  key.quota = toQuota(usage);
+  if (key.quota.monthly && key.quota.monthly.status === "ok") {
+    activate(key, via || "monthly ok");
+    runStateMachine(key);
+    return { ok: true, status: key.status };
+  }
+  return { ok: false, reason: "monthly still rate-limited" };
+}
+
 // ---------------- 调度器（L3） ----------------
 const inflight = new Map();
 const inflightInc = (id) => inflight.set(id, (inflight.get(id) || 0) + 1);
@@ -218,6 +261,7 @@ const quotaPercent = (k, w) => (k.quota && k.quota[w] ? k.quota[w].percent : 0);
 // 只有月额度健康的 key 才谈周平衡/防封。
 const DRAIN_MONTHLY_PCT = 80;    // monthly ≥80% ≈ 剩余 <5h 窗口（$12/$60）
 const DRAIN_RENEWAL_HOURS = 72;  // 距 monthly.resetsAt（=订阅续费日）≤72h 且仍有剩余
+const REVIVE_EPSILON_MS = 5 * 60 * 1000; // 隔离复查过点缓冲：monthly.resetsAt 带快照截断毫秒，防时钟/服务端延迟误判
 
 function isDrainKey(k) {
   const m = k.quota && k.quota.monthly;
@@ -247,13 +291,6 @@ function compareKeys(a, b) {
   return dWeekly || dRolling || dInflight;
 }
 
-function shouldPreSwitch(key) {
-  // 5h/周 分档阈值（BUG-004）；monthly 不触发（月额度走 drain：用完即弃，绝不因 high percent 弃用）
-  const pct = state.config.preSwitchPct;
-  const wpct = state.config.preSwitchWeeklyPct != null ? state.config.preSwitchWeeklyPct : 95;
-  return quotaPercent(key, "rolling") >= pct || quotaPercent(key, "weekly") >= wpct;
-}
-
 // 新会话 / 迁移分配：drain（月额度将尽）优先用完丢弃，其余按「周剩余最多→5h 剩余→并发」平衡
 function pickBestKey(excludeId, skipIds) {
   const cap = state.config.concurrencyPerKey;
@@ -263,21 +300,6 @@ function pickBestKey(excludeId, skipIds) {
   const pool = underCap.length ? underCap : actives;
   pool.sort(compareKeys);
   return pool[0];
-}
-
-// 预切换目标：健康（非 drain）key 中剩余最多者；无则 null（不动，让 429 failover 兜底）
-function pickPreSwitchTarget(bound) {
-  const pool = state.keys.filter((k) => k.status === "active" && k.id !== bound.id && !isDrainKey(k));
-  if (!pool.length) return null;
-  pool.sort(compareKeys);
-  return pool[0];
-}
-
-// BUG-003：预切换目标须「明显更鲜」（任一窗口低 ≥10 个百分点），否则不切，防止多 key 近限时 ping-pong 毁缓存
-const PRECHECK_MARGIN = 10;
-function meaningfullyFresher(alt, bound) {
-  return quotaPercent(alt, "rolling") <= quotaPercent(bound, "rolling") - PRECHECK_MARGIN ||
-         quotaPercent(alt, "weekly") <= quotaPercent(bound, "weekly") - PRECHECK_MARGIN;
 }
 
 function bindSession(sessionId, key) {
@@ -310,14 +332,8 @@ function getOrBindKey(sessionId) {
     const sess = state.sessions.find((x) => x.sessionId === sessionId);
     if (sess) {
       const bound = state.keys.find((k) => k.id === sess.keyId);
-      if (bound && bound.status === "active") {
-        // drain key（月额度将尽）：缓存注定丢失 → 绝不预切换走，留着用完即弃
-        if (!isDrainKey(bound) && shouldPreSwitch(bound)) {
-          const alt = pickPreSwitchTarget(bound);
-          if (alt && meaningfullyFresher(alt, bound)) { bindSession(sessionId, alt); return alt; }
-        }
-        return bound;
-      }
+      // 粘性：健康绑定绝不动（预切换已移除——90% 提前迁移毁缓存且收益已被 failover 覆盖，429 交由 failoverChain 兜底）
+      if (bound && bound.status === "active") return bound;
       // 绑定 Key 不可用（cooldown_*/quarantined/invalid）-> 重分配；rolling 冷却 key 一律不可服务（BUG-001）
       const alt = pickBestKey(null);
       if (alt) { bindSession(sessionId, alt); return alt; }
@@ -415,7 +431,7 @@ function finishRequest(key, sessionId, model, started, cacheTokens) {
 //   - 合法 thinking-only 完成（finish=stop/[DONE]，只有思考没有正文）→ 按正常完成交还；
 //   仅当 retryEmptyResponse 打开时才缓存（关掉则完全透明直通）。
 // 副作用：思考不再实时滚动（正文出现时一并出现）；这是「零输出失败→可重试」的必然代价。
-function streamThrough(clientRes, upRes, key, sessionId, model, started) {
+function streamThrough(clientRes, upRes, key, sessionId, model, started, onUsage) {
   clientRes.writeHead(upRes.statusCode, upRes.headers);
   let buf = "";
   let cacheTokens = 0;
@@ -423,12 +439,17 @@ function streamThrough(clientRes, upRes, key, sessionId, model, started) {
   let sawToolCalls = false;    // 是否出现过工具调用
   let sawDone = false;         // 是否看到 data: [DONE]
   let finishReason = null;     // 最后一个 finish_reason
+  let lastUsage = null;        // 末 chunk 的 usage（include_usage 时；备用通道计费明细用）
   let settled = false;         // finishRequest 只记一次账（abort 会 destroy 上游触发 error，需守卫防重复）
   let flushed = false;         // 已进入直通模式（缓冲已冲刷）
   const pending = [];          // 冲刷前暂存的原始 chunk
   let pendingBytes = 0;
   const MAX_PENDING = 512 * 1024; // 缓冲上限：超限降级直通（病态超长思考不撑爆内存）
-  const finishOnce = () => { if (settled) return; settled = true; finishRequest(key, sessionId, model, started, cacheTokens); };
+  const finishOnce = () => {
+    if (settled) return; settled = true;
+    finishRequest(key, sessionId, model, started, cacheTokens);
+    if (onUsage && lastUsage) { try { onUsage(lastUsage); } catch {} }
+  };
   const endClient = () => { try { clientRes.end(); } catch {} finishOnce(); };
   const flushPending = () => {
     for (const c of pending) { try { clientRes.write(c); } catch {} }
@@ -452,6 +473,7 @@ function streamThrough(clientRes, upRes, key, sessionId, model, started) {
         const data = line.slice(5).trim();
         if (data === "[DONE]") { sawDone = true; continue; }
         let ev; try { ev = JSON.parse(data); } catch { continue; }
+        if (ev.usage) lastUsage = ev.usage; // usage-only chunk（choices 为空）也要捕获
         const ch = ev.choices && ev.choices[0];
         if (!ch) continue;
         const d = ch.delta || {};
@@ -490,6 +512,8 @@ function streamThrough(clientRes, upRes, key, sessionId, model, started) {
       if (emptySoFar() && (abnormalFinish() || (!finishReason && !sawDone))) { abortClient("empty-buffer"); return; }
       flushPending();
     }
+    // 非流式响应（无 SSE）：直接从 JSON 体里补抓 usage
+    if (onUsage && !lastUsage && buf.trim().startsWith("{")) { try { const j = JSON.parse(buf); if (j.usage) lastUsage = j.usage; } catch {} }
     endClient();
   });
   upRes.on("error", () => {
@@ -512,7 +536,11 @@ async function failoverChain(res, key, out, rawBody, clientHeaders, sessionId, m
       await sleep(300 * (r + 1));
       inflightInc(key.id);
       const retry = await attemptForward(key, rawBody, clientHeaders);
-      if (retry.stream) { streamThrough(res, retry.res, key, sessionId, model, started); return; }
+      if (retry.stream) {
+        if (state.fallbackState.sessionStart) markFallbackEnd("go-recovered");
+        streamThrough(res, retry.res, key, sessionId, model, started, keyUsageRecorder(key));
+        return;
+      }
       inflightDec(key.id);
       last = retry;
       if (!TRANSIENT(last.status)) break; // 变为限额/401 -> 停止同 key 重试，走 failover
@@ -529,19 +557,204 @@ async function failoverChain(res, key, out, rawBody, clientHeaders, sessionId, m
     const nxt = await attemptForward(fallback, rawBody, clientHeaders);
     if (nxt.stream) {
       if (sessionId) bindSession(sessionId, fallback);
-      streamThrough(res, nxt.res, fallback, sessionId, model, started);
+      if (state.fallbackState.sessionStart) markFallbackEnd("go-recovered");
+      streamThrough(res, nxt.res, fallback, sessionId, model, started, keyUsageRecorder(fallback));
       return;
     }
     inflightDec(fallback.id);
     last = nxt;
   }
-  // 全部 Key 耗尽：如实回最后错误（附最近恢复时间）
+  // 全部 Key 耗尽：先试备用通道（通用 OpenAI 上游），不行再如实回最后错误（附最近恢复时间）
   addEvent("exhausted", key.id, `all keys failed (last HTTP ${last.status})`);
+  if (await tryFallback(res, rawBody, clientHeaders, sessionId, model, started)) { saveState(); return; }
   const head = { "Content-Type": "application/json" };
   if (last.retryAfter) head["Retry-After"] = last.retryAfter;
   res.writeHead(last.status, head);
   res.end(last.body || JSON.stringify({ error: { type: "GatewayError", message: "all keys exhausted" } }));
   saveState();
+}
+
+// ---------------- 备用通道（通用 OpenAI 协议上游，字段全部前端可配） ----------------
+// 设计（docs/plans/opencode-go-router-fallback-2026-08-22.md）：
+//   触发 = 三窗口语义下「无任何可用 key」；切回 = 任一 key 窗口刷新即回 Go（不粘备用）；
+//   通道 = 任意 OpenAI 兼容端点（默认 DeepSeek 官方）；计费 = 可选能力（balance | none）。
+const FALLBACK_DEFAULT_BASE = "https://api.deepseek.com";
+
+function fallbackConfig() { return state.config.fallback || {}; }
+function fallbackReady() {
+  const f = fallbackConfig();
+  return !!(f && f.enabled && f.apiKey);
+}
+// 三窗口语义（用户定稿）：可用 key = 5h/weekly/monthly 均未打满（状态机表达为 active）；
+// 任一窗口打满即不可用（weekly 满 5h 空也转不过去；monthly 满即废弃）。
+// 手动停用 / 失效 key 不计入判定；候选集合为空（没配 key）不触发备用（不烧钱）。
+function noUsableKey() {
+  const candidates = state.keys.filter((k) => k.status !== "invalid" && k.quarantineReason !== "manual");
+  if (!candidates.length) return false;
+  return !candidates.some((k) => k.status === "active");
+}
+// 通用上游解析：baseURL + /chat/completions（DeepSeek 默认、/v1 基、自定义路径基都成立）
+function fallbackUpstream(baseURL) {
+  let u;
+  try { u = new URL((baseURL != null ? baseURL : fallbackConfig().baseURL || "").trim() || FALLBACK_DEFAULT_BASE); }
+  catch { u = new URL(FALLBACK_DEFAULT_BASE); }
+  return {
+    lib: u.protocol === "http:" ? http : https,
+    hostname: u.hostname,
+    port: u.port ? Number(u.port) : u.protocol === "http:" ? 80 : 443,
+    path: u.pathname.replace(/\/+$/, "") + "/chat/completions",
+    base: u.pathname.replace(/\/+$/, ""),
+  };
+}
+// OpenAI 标准字段白名单：模型一律改写为通道模型；Go 平台私有扩展字段剔除（防上游 400）
+const FALLBACK_BODY_FIELDS = ["messages", "stream", "stream_options", "temperature", "top_p", "max_tokens", "stop", "tools", "tool_choice", "response_format", "presence_penalty", "frequency_penalty", "seed", "user"];
+function buildFallbackBody(payload, withUsage, modelOverride) {
+  const f = fallbackConfig();
+  const body = { model: modelOverride || f.model, messages: payload.messages };
+  for (const k of FALLBACK_BODY_FIELDS) if (payload[k] !== undefined) body[k] = payload[k];
+  if (withUsage && body.stream) body.stream_options = { ...(body.stream_options || {}), include_usage: true };
+  return body;
+}
+// DeepSeek 官方 /user/balance（自动计费的唯一金额口径）；其他端点自然 404 → billingMode=none
+function fetchFallbackBalance(overrides) {
+  if (MOCK) return Promise.resolve({ ok: true, isAvailable: true, balance: Math.max(0, 9.53 - state.fallbackState.costs.length * 0.01), currency: "CNY" });
+  const f = fallbackConfig();
+  const apiKey = (overrides && overrides.apiKey) || f.apiKey;
+  return new Promise((resolve) => {
+    const up = fallbackUpstream((overrides && overrides.baseURL) != null ? overrides.baseURL : undefined);
+    const req = up.lib.request({
+      hostname: up.hostname, port: up.port, path: up.base + "/user/balance", method: "GET",
+      headers: { Authorization: "Bearer " + apiKey, Accept: "application/json", "User-Agent": OUT_UA }, timeout: 20000,
+    }, (r) => {
+      let b = "";
+      r.on("data", (c) => (b += c));
+      r.on("end", () => {
+        if (r.statusCode !== 200) return resolve({ ok: false, code: r.statusCode });
+        try {
+          const j = JSON.parse(b);
+          const infos = j.balance_infos || [];
+          const pick = infos.find((x) => x.currency === "CNY") || infos.find((x) => x.currency === "USD");
+          resolve({ ok: true, isAvailable: !!j.is_available, balance: pick ? Number(pick.total_balance) : null, currency: pick ? pick.currency : null });
+        } catch (e) { resolve({ ok: false, code: "parse", msg: e.message }); }
+      });
+    });
+    req.on("error", (e) => resolve({ ok: false, code: "err", msg: e.message }));
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.end();
+  });
+}
+function recordBalanceSample(balance, currency) {
+  const s = state.fallbackState;
+  s.samples.push({ ts: new Date().toISOString(), balance, currency: currency || "CNY" });
+  s.lastSampleAt = Date.now();
+  if (s.samples.length > 3000) s.samples.splice(0, s.samples.length - 3000);
+}
+// 备用周期开始：首次兜底时快照余额（balance 模式）；sessionStart 存在即「备用中」
+function markFallbackStart() {
+  const s = state.fallbackState;
+  if (s.sessionStart) return;
+  const f = fallbackConfig();
+  s.sessionStart = { ts: new Date().toISOString(), balance: null, currency: null };
+  addEvent("fallback:start", null, `备用通道接管（${f.label || "fallback"} → ${f.model}）`);
+  if (f.billingMode !== "none") {
+    fetchFallbackBalance().then((v) => {
+      if (v.ok && v.balance != null && state.fallbackState.sessionStart) {
+        state.fallbackState.sessionStart.balance = v.balance;
+        state.fallbackState.sessionStart.currency = v.currency;
+        recordBalanceSample(v.balance, v.currency);
+        saveState();
+      }
+    });
+  }
+}
+// 备用周期结束（切回 Go / 网关重启补结算）：再快照一次余额，差值 = 官方实际扣费
+function markFallbackEnd(via) {
+  const s = state.fallbackState;
+  if (!s.sessionStart) return;
+  const start = s.sessionStart;
+  s.sessionStart = null; // 先关，防并发重复结算
+  const finish = (endBalance) => {
+    const delta = start.balance != null && endBalance != null ? Math.round((start.balance - endBalance) * 10000) / 10000 : null;
+    s.settlements.unshift({ startTs: start.ts, endTs: new Date().toISOString(), startBalance: start.balance, endBalance: endBalance == null ? null : endBalance, delta, currency: start.currency || "CNY", via: via || "go-recovered" });
+    if (s.settlements.length > 100) s.settlements.length = 100;
+    addEvent("fallback:end", null, via === "startup" ? `网关重启补结算${delta != null ? "：¥" + delta : "（金额未知）"}` : `切回 Go，本次备用消耗${delta != null ? " ¥" + delta : "（金额未知/不计费）"}`);
+    saveState();
+  };
+  if (fallbackConfig().billingMode !== "none") {
+    fetchFallbackBalance().then((v) => {
+      if (v.ok && v.balance != null) recordBalanceSample(v.balance, v.currency);
+      finish(v.ok ? v.balance : null);
+    });
+  } else finish(null);
+}
+// 窗内花费 = 相邻采样点的余额下降量之和（只计下降：充值/退款不冲抵费用）
+function fallbackWindowCost(msWindow, now = Date.now()) {
+  const since = now - msWindow;
+  const pts = state.fallbackState.samples.filter((p) => new Date(p.ts).getTime() >= since && p.balance != null);
+  let cost = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const d = pts[i - 1].balance - pts[i].balance;
+    if (d > 0) cost += d;
+  }
+  return Math.round(cost * 10000) / 10000;
+}
+function fallbackWindowCount(msWindow, now = Date.now()) {
+  const since = now - msWindow;
+  return state.fallbackState.costs.filter((c) => new Date(c.ts).getTime() >= since).length;
+}
+function attemptFallback(rawBody, clientHeaders, withUsage) {
+  return new Promise((resolve) => {
+    const f = fallbackConfig();
+    let payload; try { payload = JSON.parse(rawBody.toString("utf8")); } catch { return resolve({ stream: false, status: 400, body: "invalid JSON" }); }
+    const body = JSON.stringify(buildFallbackBody(payload, withUsage));
+    const up = fallbackUpstream();
+    const headers = {
+      Authorization: "Bearer " + f.apiKey, "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body), "User-Agent": OUT_UA,
+      Accept: clientHeaders.accept || "text/event-stream",
+    };
+    if (clientHeaders["x-request-id"]) headers["x-request-id"] = clientHeaders["x-request-id"];
+    const req = up.lib.request({ hostname: up.hostname, port: up.port, path: up.path, method: "POST", headers, timeout: 300000 }, (r) => {
+      if (r.statusCode >= 200 && r.statusCode < 300) return resolve({ stream: true, res: r });
+      let b = ""; r.on("data", (c) => (b += c));
+      r.on("end", () => resolve({ stream: false, status: r.statusCode, body: b }));
+    });
+    req.on("error", (e) => resolve({ stream: false, status: 502, body: JSON.stringify({ error: { message: e.message } }) }));
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.end(body);
+  });
+}
+// 兜底主入口：guard（启用+key+无可用 key）→ 转发（注入 include_usage；400 降级重试一次去掉注入）
+async function tryFallback(res, rawBody, clientHeaders, sessionId, model, started) {
+  const f = fallbackConfig();
+  if (!(fallbackReady() && noUsableKey())) return false;
+  let out = await attemptFallback(rawBody, clientHeaders, true);
+  if (!out.stream && out.status === 400) out = await attemptFallback(rawBody, clientHeaders, false);
+  if (!out.stream) {
+    addEvent("fallback:fail", null, `HTTP ${out.status} via ${f.label || "fallback"}`);
+    return false;
+  }
+  markFallbackStart();
+  state.fallbackState.lastFallbackAt = new Date().toISOString();
+  addEvent("fallback", null, `Go 无可用 key → ${f.label || "fallback"} ${f.model}`);
+  const recUsage = (usage) => {
+    const cached = (usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens) != null
+      ? usage.prompt_tokens_details.cached_tokens
+      : (usage.prompt_cache_hit_tokens || 0);
+    state.fallbackState.costs.unshift({
+      ts: new Date().toISOString(), model: f.model,
+      promptTokens: usage.prompt_tokens || 0, completionTokens: usage.completion_tokens || 0,
+      cacheHit: cached,
+      cacheMiss: usage.prompt_cache_miss_tokens != null ? usage.prompt_cache_miss_tokens : Math.max(0, (usage.prompt_tokens || 0) - cached),
+      reasoningTokens: (usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens) || 0,
+    });
+    if (state.fallbackState.costs.length > 2000) state.fallbackState.costs.length = 2000;
+    saveState();
+  };
+  const pseudoKey = { id: "fallback", label: f.label, stats: { requests: 0, cachedTokens: 0, cacheHits: 0 } };
+  streamThrough(res, out.res, pseudoKey, sessionId, model, started, recUsage);
+  saveState();
+  return true;
 }
 
 // GET /v1/models 透传：ZCode 启动时探测模型/思考能力，必须 200 而非 404（公开无鉴权端点）
@@ -557,6 +770,14 @@ function forwardModels(res) {
   up.end();
 }
 
+// 总 token 统计：请求注入 include_usage 后，由 streamThrough 的 onUsage 捕获并累计到 key.stats.totalTokens
+function keyUsageRecorder(key) {
+  return (u) => {
+    key.stats.totalTokens = (key.stats.totalTokens || 0) + (u.prompt_tokens || 0) + (u.completion_tokens || 0);
+    saveState();
+  };
+}
+
 function forwardChat(req, res) {
   const sessionId = req.headers["x-session-id"] || null;
   const chunks = [];
@@ -567,22 +788,31 @@ function forwardChat(req, res) {
     try { payload = JSON.parse(rawBody.toString("utf8")); } catch { return jsonError(res, 400, "invalid JSON body"); }
     const model = payload.model || "unknown";
     const started = Date.now();
+    // 流式请求注入 include_usage（与备用通道同机制）：上游在流末回 usage 块 → 总 token 可统计；上游不回则计 0 无副作用
+    let upBody = rawBody;
+    if (payload && payload.stream === true && !(payload.stream_options && payload.stream_options.include_usage)) {
+      payload.stream_options = { ...(payload.stream_options || {}), include_usage: true };
+      try { upBody = Buffer.from(JSON.stringify(payload)); } catch { upBody = rawBody; }
+    }
     const key = getOrBindKey(sessionId);
     if (!key) {
-      // 无 active Key：按 L4 如实回 429 + 最近恢复时间（正确的最终状态，不是连接错误）
+      // 无可用 Key：先试备用通道（通用 OpenAI 上游，三窗口语义触发），不行再按 L4 如实回 429 + 最近恢复时间
+      addEvent("exhausted", null, "no active key available");
+      if (await tryFallback(res, rawBody, { accept: req.headers.accept, "x-request-id": req.headers["x-request-id"] }, sessionId, model, started)) return;
       const rec = earliestRecovery();
-      addEvent("exhausted", null, "no active key available" + (rec ? " recover at " + rec : ""));
+      addEvent("exhausted", null, "fallback unavailable, honest 429" + (rec ? " recover at " + rec : ""));
       const msg = "All Go keys exhausted. " + (rec ? "Earliest recovery at " + rec : "Check gateway dashboard for key states.");
       res.writeHead(429, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ type: "error", error: { type: "GoUsageLimitError", message: msg }, metadata: rec ? { resetsAt: rec } : {} }));
     }
     inflightInc(key.id);
-    const out = await attemptForward(key, rawBody, { accept: req.headers.accept, "x-request-id": req.headers["x-request-id"] });
+    const out = await attemptForward(key, upBody, { accept: req.headers.accept, "x-request-id": req.headers["x-request-id"] });
     if (out.stream) {
-      streamThrough(res, out.res, key, sessionId, model, started);
+      if (state.fallbackState.sessionStart) markFallbackEnd("go-recovered"); // 备用中恢复 → 立刻切回 Go（用户宪法）
+      streamThrough(res, out.res, key, sessionId, model, started, keyUsageRecorder(key));
     } else {
       // 首字节前失败 -> 统一兜底：瞬时重试 → 有界 failover → 耗尽如实回错（BUG-002/005/006）
-      await failoverChain(res, key, out, rawBody, { accept: req.headers.accept, "x-request-id": req.headers["x-request-id"] }, sessionId, model, started);
+      await failoverChain(res, key, out, upBody, { accept: req.headers.accept, "x-request-id": req.headers["x-request-id"] }, sessionId, model, started);
     }
   });
 }
@@ -616,7 +846,10 @@ function summarize() {
   }
   const totalRequests = state.keys.reduce((a, k) => a + (k.stats ? k.stats.requests : 0), 0);
   const totalCached = state.keys.reduce((a, k) => a + (k.stats ? k.stats.cachedTokens : 0), 0);
-  return { version: VERSION, mode: MOCK ? "mock" : "real", uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000), counts, totalRequests, totalCachedTokens: totalCached, stateUpdatedAt: state.updatedAt };
+  // 总 token = Go 池各 key 累计 + 备用通道各请求（注入 include_usage 后由流末 usage 块统计）
+  const totalTokens = state.keys.reduce((a, k) => a + (k.stats && k.stats.totalTokens ? k.stats.totalTokens : 0), 0)
+    + state.fallbackState.costs.reduce((a, c) => a + ((c.promptTokens || 0) + (c.completionTokens || 0)), 0);
+  return { version: VERSION, mode: MOCK ? "mock" : "real", uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000), counts, totalRequests, totalTokens, totalCachedTokens: totalCached, stateUpdatedAt: state.updatedAt };
 }
 
 function apiKeyList() {
@@ -630,6 +863,122 @@ function samePoolWarnings() {
   const byWs = {};
   for (const k of state.keys) if (k.workspaceId) (byWs[k.workspaceId] = byWs[k.workspaceId] || []).push(k.id);
   return Object.entries(byWs).filter(([, ids]) => ids.length > 1).map(([ws, ids]) => ({ workspaceId: ws, keyIds: ids }));
+}
+
+// 控制面回显配置：localToken 与 fallback.apiKey 一律掩码（密钥永不回传前端）
+function maskedConfig() {
+  const f = state.config.fallback || {};
+  return { ...state.config, localToken: state.config.localToken ? "(set)" : null, fallback: { ...f, apiKey: f.apiKey ? "(set)" : null } };
+}
+
+// Agent 对接指引：运行时生成（注入本机安装目录与端口），不含任何硬编码个人信息。
+// 用户把这段委派提示词发给自己的 AI 助手，助手读源码与文档后完成客户端接入与跟随启动评估。
+function agentGuidePrompt() {
+  const url = `http://127.0.0.1:${PORT}`;
+  const dir = __dirname;
+  return [
+    `你是我的配置助手。本机正在通过管理界面 ${url} 使用 OpenCode Go 多 Key 网关，OpenAI 兼容端点 ${url}/v1（chat/completions、models）。`,
+    `请把我的编程助手（ZCode / Claude Code / 其他 OpenAI 兼容客户端）接入该网关：`,
+    `1. 读以下材料理解本项目的运行方式：开源仓库 https://github.com/Duanzhoutao/opencode-go-router 的 README 与 docs/（入口 docs/README.md：client-integration.md 客户端接入、guard.md 跟随启动钩子、architecture.md 多 Key 路由与缓存粘性、configuration.md 配置、faq.md 排错）；本机源码 ${dir}（README.md、docs/、go-gateway.cjs、go-guard.cjs）。`,
+    `2. 把我客户端的模型 baseURL 改为 ${url}/v1，apiKey 用占位符（如 sk-local-gateway）；改前先备份配置文件，保留原 provider（设为 disabled）作逃生门。`,
+    `3. 评估我的客户端能否同时启用跟随启动（如 SessionStart 钩子机制）：能则一并配置并验证，不能则说明原因，不硬做。`,
+    `边界：只动模型接入相关配置；修改任何文件前先列出改动征求我同意；事实先检测再下结论，不猜。`,
+    `完成后汇报：改了哪些文件、如何回退、验证结果（经网关发一条测试请求）。`,
+  ].join("\n");
+}
+
+// ---------------- 备用通道：视图 / 立刻计算 / 配置 / 测试连接 ----------------
+function fallbackView() {
+  const f = fallbackConfig();
+  const s = state.fallbackState;
+  const lastSample = s.samples.length ? s.samples[s.samples.length - 1] : null;
+  const H = 3600e3;
+  const win = (h) => ({ cost: fallbackWindowCost(h * H), count: fallbackWindowCount(h * H) });
+  const currentSpent = s.sessionStart && s.sessionStart.balance != null && lastSample && lastSample.balance != null
+    ? Math.round((s.sessionStart.balance - lastSample.balance) * 10000) / 10000 : null;
+  return {
+    config: { ...f, apiKey: f.apiKey ? "(set)" : null },
+    effectiveBaseURL: (f.baseURL || "").trim() || FALLBACK_DEFAULT_BASE,
+    active: !!s.sessionStart,
+    sessionStart: s.sessionStart,
+    lastFallbackAt: s.lastFallbackAt,
+    lastSample, currentSpent,
+    windows: { h24: win(24), d7: win(24 * 7), d14: win(24 * 14), d30: win(24 * 30) },
+    settlements: s.settlements.slice(0, 10),
+    recentCosts: s.costs.slice(0, 20),
+  };
+}
+
+function handleFallbackView(req, res) { return json(res, 200, fallbackView()); }
+
+// 「立刻计算」：立即采样一次余额（用户手动刷新，不加定时器）
+async function handleFallbackRefresh(req, res) {
+  const f = fallbackConfig();
+  if (!(f.enabled && f.apiKey)) return jsonError(res, 400, "备用通道未启用或未配置 Key");
+  if (f.billingMode === "none") return json(res, 200, { ok: true, note: "该通道不计费（billingMode=none）" });
+  const v = await fetchFallbackBalance();
+  if (!v.ok) return json(res, 502, { ok: false, msg: `balance check failed: ${v.code} ${v.msg || ""}` });
+  recordBalanceSample(v.balance, v.currency);
+  saveState();
+  return json(res, 200, { ok: true, balance: v.balance, currency: v.currency, isAvailable: v.isAvailable });
+}
+
+async function handleFallbackPatch(req, res) {
+  const body = await readBody(req);
+  if (body == null) return jsonError(res, 400, "invalid body");
+  const f = state.config.fallback;
+  if (typeof body.enabled === "boolean") f.enabled = body.enabled;
+  if (typeof body.label === "string") f.label = body.label.trim().slice(0, 40) || "备用通道";
+  if (typeof body.baseURL === "string") {
+    const u = body.baseURL.trim();
+    if (u === "" || /^https?:\/\//.test(u)) f.baseURL = u;
+    else return jsonError(res, 400, "baseURL 须以 http(s):// 开头或留空");
+  }
+  if (body.apiKey === "" || body.apiKey === null) f.apiKey = null;
+  else if (typeof body.apiKey === "string" && body.apiKey.trim().length >= 8) f.apiKey = body.apiKey.trim();
+  if (typeof body.model === "string" && body.model.trim()) f.model = body.model.trim().slice(0, 120);
+  if (body.billingMode === "balance" || body.billingMode === "none") f.billingMode = body.billingMode;
+  addEvent("config", null, "fallback config updated (enabled=" + f.enabled + ", model=" + f.model + ")");
+  saveState();
+  return json(res, 200, { ok: true, fallback: { ...f, apiKey: f.apiKey ? "(set)" : null } });
+}
+
+// 最小连通性探测（chat 一次小请求 + balance 一次 GET），支持用 body 里的候选配置试（未保存也能测）
+function fallbackProbeChat(baseURL, apiKey, model) {
+  return new Promise((resolve) => {
+    let u; try { u = new URL(baseURL); } catch { return resolve({ ok: false, status: "badURL" }); }
+    const lib = u.protocol === "http:" ? http : https;
+    const base = u.pathname.replace(/\/+$/, "");
+    const body = JSON.stringify({ model, messages: [{ role: "user", content: "hi" }], max_tokens: 16, stream: false });
+    const req = lib.request({
+      hostname: u.hostname, port: u.port ? Number(u.port) : u.protocol === "http:" ? 80 : 443,
+      path: base + "/chat/completions", method: "POST",
+      headers: { Authorization: "Bearer " + apiKey, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body), "User-Agent": OUT_UA, Accept: "application/json" },
+      timeout: 30000,
+    }, (r) => {
+      let b = ""; r.on("data", (c) => (b += c));
+      r.on("end", () => resolve({ ok: r.statusCode >= 200 && r.statusCode < 300, status: r.statusCode, body: b.slice(0, 300) }));
+    });
+    req.on("error", (e) => resolve({ ok: false, status: "err", msg: e.message }));
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.end(body);
+  });
+}
+async function handleFallbackTest(req, res) {
+  const body = (await readBody(req)) || {};
+  const f = fallbackConfig();
+  const baseURL = (typeof body.baseURL === "string" ? body.baseURL : f.baseURL || "").trim() || FALLBACK_DEFAULT_BASE;
+  const apiKey = (typeof body.apiKey === "string" && body.apiKey.trim().length >= 8) ? body.apiKey.trim() : f.apiKey;
+  const model = (typeof body.model === "string" && body.model.trim()) ? body.model.trim() : f.model;
+  if (!apiKey) return json(res, 200, { ok: false, msg: "未配置 API Key" });
+  const chat = MOCK ? { ok: true, status: 200, body: "(mock)" } : await fallbackProbeChat(baseURL, apiKey, model);
+  const bal = MOCK ? { ok: true, balance: 9.53, currency: "CNY", isAvailable: true } : await fetchFallbackBalance({ baseURL, apiKey });
+  addEvent("fallback-test", null, `chat=${chat.ok ? "OK(" + chat.status + ")" : "FAIL(" + (chat.status || chat.msg) + ")"} billing=${bal.ok ? "支持" : "不支持"}`);
+  return json(res, 200, {
+    ok: true,
+    chat,
+    billing: bal.ok ? { supported: true, balance: bal.balance, currency: bal.currency, isAvailable: bal.isAvailable } : { supported: false },
+  });
 }
 
 // ---------------- MOCK_MODE 合成剧本 ----------------
@@ -712,6 +1061,7 @@ const server = http.createServer((req, res) => {
 
   // 控制面 API
   if (req.method === "GET" && p === "/api/status") return json(res, 200, { ...summarize(), warnings: samePoolWarnings() });
+  if (req.method === "GET" && p === "/api/guide") return json(res, 200, { prompt: agentGuidePrompt() });
   if (req.method === "GET" && p === "/api/keys") return json(res, 200, { keys: apiKeyList(), warnings: samePoolWarnings() });
   if (req.method === "GET" && p === "/api/sessions") return json(res, 200, { sessions: state.sessions });
   if (req.method === "GET" && p === "/api/events") {
@@ -723,13 +1073,18 @@ const server = http.createServer((req, res) => {
     if (keyId) list = list.filter((e) => e.keyId === keyId);
     return json(res, 200, { events: list.slice(0, limit) });
   }
-  if (req.method === "GET" && p === "/api/config") return json(res, 200, { config: { ...state.config, localToken: state.config.localToken ? "(set)" : null } });
+  if (req.method === "GET" && p === "/api/config") return json(res, 200, { config: maskedConfig() });
+  if (req.method === "GET" && p === "/api/fallback") return handleFallbackView(req, res);
+  if (req.method === "POST" && p === "/api/fallback/refresh") return handleFallbackRefresh(req, res);
+  if (req.method === "POST" && p === "/api/fallback/test") return handleFallbackTest(req, res);
+  if (req.method === "PATCH" && p === "/api/fallback") return handleFallbackPatch(req, res);
 
   if (req.method === "POST" && p === "/api/keys") return handleEnroll(req, res);
   if (req.method === "POST" && p === "/api/keys/refresh-all") return handleRefreshAll(req, res);
   if (req.method === "PATCH" && p.startsWith("/api/keys/")) return handlePatchKey(req, res, url);
   if (req.method === "DELETE" && p.startsWith("/api/keys/")) return handleDeleteKey(req, res, url);
   if (req.method === "POST" && p.startsWith("/api/keys/") && p.endsWith("/refresh")) return handleRefresh(req, res, url);
+  if (req.method === "POST" && p.startsWith("/api/keys/") && p.endsWith("/reactivate-all")) return handleReactivateAll(req, res);
   if (req.method === "POST" && p.startsWith("/api/keys/") && p.endsWith("/reactivate")) return handleReactivate(req, res, url);
   if (req.method === "POST" && p.startsWith("/api/keys/") && p.endsWith("/quarantine")) return handleQuarantine(req, res, url);
 
@@ -858,17 +1213,67 @@ async function handleReactivate(req, res, url) {
   }
   const v = await fetchUsage(key.key);
   if (v.ok) {
-    key.quota = toQuota(v.usage);
-    if (key.quota.monthly.status === "ok") {
-      key.status = "active"; key.quarantinedAt = null; key.quarantineReason = null;
-      addEvent("reactivate", key.id, "monthly ok -> active"); saveState();
-      return json(res, 200, { ok: true, status: "active" });
-    }
+    const r = activateFromUsage(key, v.usage, "manual");
+    if (r.ok) { saveState(); return json(res, 200, { ok: true, status: r.status }); }
     addEvent("reactivate", key.id, "monthly still rate-limited"); saveState();
     return json(res, 400, { ok: false, msg: "monthly 仍限额 — 需续订 Go 订阅（新月周期重置），充 Zen 余额不重置 $60 配额" });
   }
   if (v.code === 401) { key.status = "invalid"; key.quarantineReason = "auth_invalid"; addEvent("invalid", key.id, "reactivate check got 401"); saveState(); return json(res, 400, { ok: false, msg: "invalid key (401) — 已标失效" }); }
   return json(res, 502, { ok: false, msg: `usage check failed: ${v.code}` });
+}
+
+// 隔离区「一键查询」：手动点击 = 全部 Key 重查一次（用户要求「既然手动点了，就都查询一次」）。
+// 作用域 = 除 invalid 外的所有 Key：active/cooldown 走常规刷新（quota + 状态机），
+// quarantined 走恢复门禁（monthly ok 才回池），401 分别按各自语义处理。
+async function handleReactivateAll(req, res) {
+  const results = [];
+  for (const key of state.keys) {
+    if (key.status === "invalid") continue; // 失效 Key 不重查（401 死 Key，查了无意义）
+    if (MOCK) {
+      if (key.status === "quarantined") {
+        const m = key.quota && key.quota.monthly;
+        if (m && m.status === "ok") {
+          key.status = "active"; key.quarantinedAt = null; key.quarantineReason = null;
+          addEvent("recover", key.id, "back to active (manual, mock)");
+          results.push({ id: key.id, ok: true, revived: true });
+        } else {
+          results.push({ id: key.id, ok: false, reason: m && m.status === "rate-limited" ? "monthly still rate-limited" : "cannot revive" });
+        }
+      } else {
+        key.quota = mockUsage(Math.min(100, quotaPercent(key, "rolling") + 7), quotaPercent(key, "weekly"), quotaPercent(key, "monthly"));
+        results.push({ id: key.id, ok: true });
+      }
+      continue;
+    }
+    const v = await fetchUsage(key.key);
+    if (!v.ok) {
+      if (v.code === 401) {
+        if (key.status === "quarantined") {
+          key.status = "invalid"; key.quarantineReason = "auth_invalid";
+          addEvent("invalid", key.id, "reactivate-all check got 401");
+          results.push({ id: key.id, ok: false, reason: "401 invalid" });
+        } else {
+          quarantine(key, "auth_invalid");
+          results.push({ id: key.id, ok: false, reason: "401 invalid" });
+        }
+      } else {
+        results.push({ id: key.id, ok: false, reason: `usage check failed: ${v.code}` });
+      }
+      continue;
+    }
+    if (key.status === "quarantined") {
+      const r = activateFromUsage(key, v.usage, "manual (batch)");
+      results.push({ id: key.id, ok: r.ok, status: r.ok ? r.status : undefined, revived: r.ok ? true : undefined, reason: r.ok ? undefined : r.reason });
+    } else {
+      key.quota = toQuota(v.usage);
+      runStateMachine(key);
+      results.push({ id: key.id, ok: true });
+    }
+  }
+  saveState();
+  const okN = results.filter((x) => x.ok).length;
+  addEvent("refresh", null, `reactivate-all: ok=${okN} failed=${results.length - okN}`);
+  return json(res, 200, { ok: true, results });
 }
 
 function handleQuarantine(req, res, url) {
@@ -885,8 +1290,6 @@ async function handlePatchConfig(req, res) {
   if (body == null) return jsonError(res, 400, "invalid body");
   const c = state.config;
   if (typeof body.pollIntervalMs === "number" && body.pollIntervalMs >= 5 * 60 * 1000 && body.pollIntervalMs <= 60 * 60 * 1000) c.pollIntervalMs = body.pollIntervalMs;
-  if (typeof body.preSwitchPct === "number" && body.preSwitchPct >= 0 && body.preSwitchPct <= 100) c.preSwitchPct = body.preSwitchPct;
-  if (typeof body.preSwitchWeeklyPct === "number" && body.preSwitchWeeklyPct >= 0 && body.preSwitchWeeklyPct <= 100) c.preSwitchWeeklyPct = body.preSwitchWeeklyPct;
   if (typeof body.concurrencyPerKey === "number" && body.concurrencyPerKey >= 1 && body.concurrencyPerKey <= 8) c.concurrencyPerKey = body.concurrencyPerKey;
   if (typeof body.stickyEnabled === "boolean") c.stickyEnabled = body.stickyEnabled;
   if (typeof body.retryEmptyResponse === "boolean") c.retryEmptyResponse = body.retryEmptyResponse;
@@ -894,7 +1297,7 @@ async function handlePatchConfig(req, res) {
   if (body.localToken === "") c.localToken = null;
   addEvent("config", null, "runtime config updated");
   saveState();
-  return json(res, 200, { ok: true, config: { ...c, localToken: c.localToken ? "(set)" : null } });
+  return json(res, 200, { ok: true, config: maskedConfig() });
 }
 
 // MOCK：/v1/models 返回固定模型列表（ZCode 探测思考能力用，不可 404）
@@ -916,9 +1319,34 @@ function mockChat(req, res) {
     let key = state.keys.find((k) => k.status === "active");
     const sess = state.sessions.find((s) => s.sessionId === sessionId);
     if (sess) { const b = state.keys.find((k) => k.id === sess.keyId && k.status === "active"); if (b) key = b; }
-    if (!key) return jsonError(res, 429, { error: { type: "GoUsageLimitError", message: "mock: no active key", metadata: {} } });
+    if (!key) {
+      // 兜底（MOCK 演示）：无可用 key 且备用通道就绪 → 合成备用 SSE 流（真实路径见 tryFallback）
+      if (fallbackReady() && noUsableKey()) {
+        markFallbackStart();
+        state.fallbackState.lastFallbackAt = new Date().toISOString();
+        const f = fallbackConfig();
+        addEvent("fallback", null, `Go 无可用 key → ${f.label || "fallback"} ${f.model}（mock）`);
+        state.fallbackState.costs.unshift({ ts: new Date().toISOString(), model: f.model, promptTokens: 120, completionTokens: 8, cacheHit: 0, cacheMiss: 120, reasoningTokens: 8 });
+        saveState();
+        res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store" });
+        const fid = "mock-fb-" + Date.now();
+        res.write(`data: ${JSON.stringify({ id: fid, object: "chat.completion.chunk", model: f.model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
+        setTimeout(() => {
+          res.write(`data: ${JSON.stringify({ id: fid, object: "chat.completion.chunk", model: f.model, choices: [{ index: 0, delta: { content: "[mock-fallback] Go 无可用 key，已走备用通道 " + (f.label || "fallback") + " → " + f.model }, finish_reason: null }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id: fid, object: "chat.completion.chunk", model: f.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id: fid, object: "chat.completion", model: f.model, choices: [], usage: { prompt_tokens: 120, completion_tokens: 8, prompt_tokens_details: { cached_tokens: 0 }, completion_tokens_details: { reasoning_tokens: 8 } } })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }, 150);
+        return;
+      }
+      return jsonError(res, 429, { error: { type: "GoUsageLimitError", message: "mock: no active key", metadata: {} } });
+    }
+    if (state.fallbackState.sessionStart) markFallbackEnd("go-recovered"); // 备用中恢复 → 切回 Go
     bindSession(sessionId, key);
-    key.stats.requests += 1; saveState();
+    key.stats.requests += 1;
+    key.stats.totalTokens = (key.stats.totalTokens || 0) + 15; // mock 流末 usage 块等值
+    saveState();
     res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store" });
     const id = "mock-" + Date.now();
     res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
@@ -943,11 +1371,40 @@ async function runPoll() {
   try {
     if (MOCK) return;
     for (const key of state.keys) {
-      if (key.status === "invalid" || key.status === "quarantined") continue; // 隔离区不轮询
+      if (key.status === "invalid") continue;
+      if (key.status === "quarantined") {
+        // 隔离区自动复查（L6 增强）：仅月限隔离且已过续费日+ε 的 Key 才查 /usage；
+        // monthly 恢复 → 自动回池；过点仍限 → 标 monthly_dead 停止复查（一次性耗尽，等手动一键查询/激活）
+        if (!quarantineDueForCheck(key)) continue;
+        const v = await fetchUsage(key.key);
+        if (!v.ok) {
+          // 隔离 Key 遇 401：quarantine() 对已是 quarantined 的状态是空操作，直接标 invalid（与单 Key 激活路径一致）
+          if (v.code === 401 && key.quarantineReason !== "auth_invalid") {
+            key.status = "invalid"; key.quarantineReason = "auth_invalid";
+            addEvent("invalid", key.id, "poll check got 401");
+          }
+          continue;
+        }
+        const r = activateFromUsage(key, v.usage, "auto (renewal)");
+        if (!r.ok && key.quarantineReason !== "monthly_dead") {
+          key.quarantineReason = "monthly_dead";
+          addEvent("quarantine", key.id, "reason=monthly_dead (past resetsAt, no renewal)");
+        }
+        continue;
+      }
       const v = await fetchUsage(key.key);
       if (!v.ok) { if (v.code === 401) quarantine(key, "auth_invalid"); continue; }
       key.quota = toQuota(v.usage);
       runStateMachine(key);
+    }
+    // 备用通道余额采样（balance 模式）：并入现有轮询循环、按 balanceSampleMs 节流，不新增定时器
+    const fb = state.config.fallback;
+    if (fb && fb.enabled && fb.apiKey && fb.billingMode !== "none") {
+      const now = Date.now();
+      if (now - (state.fallbackState.lastSampleAt || 0) >= (fb.balanceSampleMs || 15 * 60 * 1000)) {
+        const v = await fetchFallbackBalance();
+        if (v.ok && v.balance != null) recordBalanceSample(v.balance, v.currency);
+      }
     }
     saveState();
   } catch (e) { log("poll error: " + e.message); }
@@ -957,15 +1414,25 @@ async function runPoll() {
 // ---------------- 启动 ----------------
 loadState();
 ensureMockData();
+// 关网关边界（用户定稿）：上次关闭时仍处备用态未结算 → 启动即自动补一次结算，不丢账
+//（无论此刻是否还启用：未结算周期都要闭合；查不到余额/不计费时金额记 null）
+if (!MOCK && state.fallbackState.sessionStart) {
+  markFallbackEnd("startup");
+}
 if (!MOCK) {
   log(`gateway real mode, state=${STATE_FILE}, keys=${state.keys.length}`);
 } else {
   log(`gateway MOCK_MODE, state=${STATE_FILE}, keys=${state.keys.length}`);
 }
 
-// 自测钩子：GO_NO_LISTEN=1 时跳过启动，仅导出 streamThrough 供单测驱动（不影响正常启动路径）
+// 自测钩子：GO_NO_LISTEN=1 时跳过启动，仅导出供单测驱动（不影响正常启动路径）
 if (process.env.GO_NO_LISTEN === "1") {
-  module.exports = { streamThrough, config: state.config, state };
+  module.exports = {
+    streamThrough, quarantineDueForCheck, activateFromUsage,
+    noUsableKey, buildFallbackBody, fallbackUpstream, fallbackWindowCost, fallbackWindowCount,
+    markFallbackStart, markFallbackEnd, recordBalanceSample, fallbackConfig, fallbackReady,
+    config: state.config, state,
+  };
 } else {
   server.on("error", (e) => { if (e.code === "EADDRINUSE") log("FATAL: port " + PORT + " already in use"); else log("server error: " + e.message); process.exit(1); });
   server.listen(PORT, "127.0.0.1", () => {

@@ -12,12 +12,21 @@ const STATUS_LABEL = {
   invalid: "失效",
 };
 const WINDOW_LABEL = { rolling: "5h", weekly: "周", monthly: "月" };
+const REASON_CN = {
+  monthly: "月限耗尽",
+  monthly_dead: "月限耗尽·未续订",
+  auth_invalid: "认证失效",
+  manual: "手动停用",
+};
 
 let state = {
-  status: null, keys: [], sessions: [], events: [], config: null,
+  status: null, keys: [], sessions: [], events: [], config: null, fallback: null, evFilter: "",
 };
 let currentView = "overview";
 let pollTimer = null;
+let fbDirty = false;       // 备用通道表单编辑中：不被自动刷新覆盖
+let cfgDirty = false;      // 设置表单编辑中：不被自动刷新覆盖
+let fbWin = "h24";         // 费用时间窗选中项
 
 // ---------- 工具 ----------
 function toast(msg, isErr) {
@@ -75,11 +84,11 @@ async function api(path, opts) {
 
 async function refreshAll(silent) {
   try {
-    const [st, k, se, ev, cfg] = await Promise.all([
+    const [st, k, se, ev, cfg, fb] = await Promise.all([
       api("/api/status"), api("/api/keys"), api("/api/sessions"),
-      api("/api/events?limit=60"), api("/api/config"),
+      api("/api/events?limit=60"), api("/api/config"), api("/api/fallback"),
     ]);
-    state.status = st; state.keys = k.keys; state.sessions = se.sessions; state.events = ev.events; state.config = cfg.config;
+    state.status = st; state.keys = k.keys; state.sessions = se.sessions; state.events = ev.events; state.config = cfg.config; state.fallback = fb;
     render();
   } catch (e) {
     showBanner("无法连接网关：" + e.message, true);
@@ -94,6 +103,7 @@ function render() {
   renderKeys();
   renderQuarantine();
   renderSessions();
+  renderFallback();
   renderEvents();
   renderSettings();
 }
@@ -147,7 +157,7 @@ function renderOverview() {
     ["quarantined", counts.quarantined, "隔离"],
     ["invalid", counts.invalid, "失效"],
     ["requests", st ? st.totalRequests : 0, "总请求"],
-    ["cached", fmtTokens(st ? st.totalCachedTokens : 0), "缓存 token"],
+    ["cached", fmtTokens(st ? st.totalTokens : 0), "总 token"],
   ].map(([cls, num, lbl]) => `<div class="stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`).join("");
 
   const grid = $("#keyGrid");
@@ -155,7 +165,6 @@ function renderOverview() {
 
   const activeKeys = state.keys.filter((k) => k.status !== "quarantined" && k.status !== "invalid");
   grid.innerHTML = activeKeys.map((k) => {
-    const sess = state.sessions.find((s) => s.keyId === k.id);
     const same = dup.has(k.id);
     return `<div class="key-card${same ? " same-pool" : ""}" data-id="${esc(k.id)}">
       <div class="kc-head">
@@ -172,14 +181,13 @@ function renderOverview() {
       <div class="quota-bars">${qbar(k, "rolling")}${qbar(k, "weekly")}${qbar(k, "monthly")}</div>
       <div class="kc-foot">
         <span>会话请求 <b>${k.stats ? k.stats.requests : 0}</b></span>
-        <span>缓存命中 <b>${k.stats ? k.stats.cacheHits : 0}</b> (${k.stats ? fmtTokens(k.stats.cachedTokens) : "0"})</span>
-        <span title="当前粘在此 Key 上的会话">🔗 ${sess ? shortSession(sess.sessionId, 14) : "无"}</span>
+        <span title="有缓存收益的请求次数（粘住同一把 Key、未因切换丢缓存），非缓存 token 量">缓存命中 <b>${k.stats ? k.stats.cacheHits : 0} 次</b></span>
       </div>
     </div>`;
   }).join("");
 
   $("#overviewEmpty").classList.toggle("hidden", activeKeys.length > 0);
-  if (dup.size) showBanner("⚠️ 检测到同 workspace 共享额度池（多个 Key 同池 = 轮换无效），卡片已红框标出。", false);
+  if (dup.size) showBanner("⚠️ 检测到同池 Key（轮换无效），已红框标出。", false);
   else hideBanner();
 }
 
@@ -192,7 +200,7 @@ function renderKeys() {
     <td>${statusBadge(k.status)}</td>
     <td>${dup.has(k.id) ? '<span class="tag same-workspace-alert">同池</span>' : "—"}</td>
     <td>${k.stats ? k.stats.requests : 0}</td>
-    <td>${k.stats ? `${k.stats.cacheHits} / ${fmtTokens(k.stats.cachedTokens)}` : "0 / 0"}</td>
+    <td title="有缓存收益的请求次数（粘住同一把 Key、未因切换丢缓存），非缓存 token 量">${k.stats ? k.stats.cacheHits + " 次" : "—"}</td>
     <td>
       <button class="btn small" data-act="refresh" data-id="${esc(k.id)}">刷新</button>
       <button class="btn small" data-act="edit" data-id="${esc(k.id)}">编辑</button>
@@ -208,7 +216,7 @@ function renderQuarantine() {
     <td><b>${esc(k.label)}</b></td>
     <td class="mono">${esc(k.key)}</td>
     <td>${statusBadge(k.status)}</td>
-    <td>${esc(k.quarantineReason || "—")}</td>
+    <td>${esc(k.status === "invalid" ? "认证失效" : (REASON_CN[k.quarantineReason] || k.quarantineReason || "—"))}</td>
     <td class="mono">${fmtTs(k.quarantinedAt)}</td>
     <td class="mono">${k.quota && k.quota.monthly ? fmtTs(k.quota.monthly.resetsAt) : "—"}</td>
     <td>
@@ -232,21 +240,211 @@ function renderSessions() {
     : `<tr><td colspan="5" style="color:var(--muted)">暂无会话绑定——ZCode 发起请求后会自动绑定到 Key。</td></tr>`;
 }
 
-const EV_TYPES = ["bind", "migrate", "enroll", "cooldown", "rate-limited", "failover", "quarantine", "recover", "reactivate", "invalid", "exhausted", "cache-hit", "same-workspace-alert", "upstream-5xx", "empty-stream", "delete", "edit", "config", "refresh"];
+// ---------- 备用通道视图 ----------
+const FB_WIN_LABEL = { h24: "近24小时", d7: "近一周", d14: "近两周", d30: "近一个月" };
+const FB_SETTLE_VIA = { "go-recovered": "切回 Go", startup: "重启补结算" };
+
+function renderFallback() {
+  const fb = state.fallback;
+  if (!fb) return;
+  const cfg = fb.config || {};
+  // 表单：编辑中不覆盖
+  if (!fbDirty) {
+    $("#fbEnabled").checked = !!cfg.enabled;
+    $("#fbLabel").value = cfg.label || "";
+    $("#fbBaseURL").value = cfg.baseURL || "";
+    $("#fbApiKey").value = "";
+    $("#fbApiKey").placeholder = cfg.apiKey ? "已保存（留空保持不变）" : "sk-…";
+    $("#fbModel").value = cfg.model || "";
+    if (typeof fbBillingDD !== "undefined") fbBillingDD.set(cfg.billingMode || "balance");
+  }
+  // 状态徽标 + 概要
+  $("#fbActiveBadge").classList.toggle("hidden", !fb.active);
+  // 费用区（balance 模式显示金额；none 模式只显示次数）
+  const billing = cfg.billingMode !== "none";
+  const w = (fb.windows || {})[fbWin] || { cost: null, count: 0 };
+  const money = (v) => (v == null ? "—" : `¥${v}`);
+  $("#fbCostMain").innerHTML = billing ? [
+    ["active", money(fb.lastSample ? fb.lastSample.balance : null), "当前余额"],
+    ["quarantined", money(fb.currentSpent), "本次备用已花"],
+    ["requests", money(w.cost), `${FB_WIN_LABEL[fbWin]}花费`],
+    ["cached", w.count, `${FB_WIN_LABEL[fbWin]}兜底次数`],
+  ].map(([cls, num, lbl]) => `<div class="stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`).join("")
+    : [
+      ["requests", w.count, `${FB_WIN_LABEL[fbWin]}兜底次数`],
+      ["quarantined", "不计费", "该通道无自动计费"],
+    ].map(([cls, num, lbl]) => `<div class="stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`).join("");
+  $$("#fbWindows [data-win]").forEach((b) => b.classList.toggle("primary", b.dataset.win === fbWin));
+  $("#fbWindowDetail").textContent = `生效端点：${fb.effectiveBaseURL} · 模型：${cfg.model || "—"}${fb.lastFallbackAt ? " · 最近兜底 " + fmtTs(fb.lastFallbackAt) : ""}`;
+  // 结算表
+  const tb = $("#fbSettleTable tbody");
+  tb.innerHTML = fb.settlements && fb.settlements.length ? fb.settlements.map((s) => `<tr>
+    <td class="mono">${fmtTs(s.startTs)}</td>
+    <td class="mono">${fmtTs(s.endTs)}</td>
+    <td>${s.startBalance != null ? "¥" + s.startBalance : "—"}</td>
+    <td>${s.endBalance != null ? "¥" + s.endBalance : "—"}</td>
+    <td><b>${s.delta != null ? "¥" + s.delta : "—"}</b></td>
+    <td>${FB_SETTLE_VIA[s.via] || s.via || "—"}</td>
+  </tr>`).join("") : `<tr><td colspan="6" style="color:var(--muted)">暂无结算——每次备用周期（接管 → 切回）结算一次。</td></tr>`;
+  // 兜底请求明细
+  $("#fbCosts").innerHTML = fb.recentCosts && fb.recentCosts.length ? fb.recentCosts.map((c) => `<li>
+    <span class="t">${fmtTs(c.ts)}</span>
+    <span class="tag fallback">兜底</span>
+    <span><b>${esc(c.model || "—")}</b> · in ${fmtTokens(c.promptTokens)}（命中 ${fmtTokens(c.cacheHit)}）· out ${fmtTokens(c.completionTokens)}（思考 ${fmtTokens(c.reasoningTokens)}）</span>
+  </li>`).join("") : `<li style="grid-template-columns:1fr;color:var(--muted)">暂无兜底请求明细</li>`;
+}
+
+async function saveFallback(e) {
+  e.preventDefault();
+  const body = {
+    enabled: $("#fbEnabled").checked,
+    label: $("#fbLabel").value.trim(),
+    baseURL: $("#fbBaseURL").value.trim(),
+    model: $("#fbModel").value.trim(),
+    billingMode: (typeof fbBillingDD !== "undefined" && fbBillingDD.get()) || "balance",
+  };
+  const k = $("#fbApiKey").value.trim();
+  if (k) body.apiKey = k; // 留空 = 保持不变
+  try {
+    await api("/api/fallback", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    toast("备用通道配置已保存");
+    fbDirty = false;
+  } catch (err) { toast(err.message, true); }
+  refreshAll(true);
+}
+
+async function testFallback() {
+  const btn = $("#btnFbTest");
+  btn.disabled = true;
+  $("#fbTestResult").textContent = "测试中…（发一个最小请求 + 探测计费端点）";
+  try {
+    const body = {
+      baseURL: $("#fbBaseURL").value.trim(),
+      model: $("#fbModel").value.trim(),
+    };
+    const k = $("#fbApiKey").value.trim();
+    if (k) body.apiKey = k;
+    const r = await api("/api/fallback/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) { $("#fbTestResult").textContent = "❌ " + (r.msg || "测试失败"); return; }
+    const chat = r.chat || {};
+    const bal = r.billing || {};
+    $("#fbTestResult").textContent = chat.ok
+      ? `✅ 连接成功（HTTP ${chat.status}）· 自动计费：${bal.supported ? `支持（余额 ¥${bal.balance ?? "—"} ${bal.currency || ""}）` : "不支持（请选「不计费」）"}`
+      : `❌ 连接失败（HTTP ${chat.status}${chat.msg ? " " + chat.msg : ""}）${r.body ? "" : ""}——检查 Base URL / Key / 模型名`;
+  } catch (e) {
+    $("#fbTestResult").textContent = "❌ 测试失败：" + e.message;
+  } finally { btn.disabled = false; }
+}
+
+// 「立刻计算」：立即采样一次余额并重算差值
+async function refreshFallbackCost() {
+  const btn = $("#btnFbRefresh");
+  btn.disabled = true;
+  try {
+    const r = await api("/api/fallback/refresh", { method: "POST" });
+    toast(r.note ? r.note : `已更新：当前余额 ¥${r.balance}`);
+  } catch (e) { toast("计算失败：" + e.message, true); }
+  btn.disabled = false;
+  refreshAll(true);
+}
+
+const EV_TYPES = ["bind", "migrate", "enroll", "cooldown", "rate-limited", "failover", "quarantine", "recover", "reactivate", "invalid", "exhausted", "cache-hit", "same-workspace-alert", "upstream-5xx", "empty-stream", "delete", "edit", "config", "refresh", "fallback", "fallback:start", "fallback:end", "fallback:fail", "fallback-test"];
+
+// 事件类型解释（悬停标签 / 下拉选项小注共用；标签本身保持英文 type）
+const EV_EXPLAIN = {
+  bind: "会话首次绑定到某把 Key",
+  migrate: "会话迁移到另一把 Key（原 Key 不可用）",
+  enroll: "录入新 Key 并校验通过",
+  cooldown: "Key 进入冷却（对应窗口额度打满）",
+  "rate-limited": "上游返回 429 限流",
+  failover: "请求失败后自动切换到另一把 Key 重试",
+  quarantine: "Key 进入隔离区（月限耗尽 / 手动停用）",
+  recover: "Key 恢复可用（窗口额度重置）",
+  reactivate: "手动重新激活 Key",
+  invalid: "Key 认证失效（401），需删除重录",
+  exhausted: "所有 Key 都失败，请求被如实拒绝",
+  "cache-hit": "该请求命中上游缓存（有缓存收益）",
+  "same-workspace-alert": "多把 Key 共享同一额度池（轮换无效）",
+  "upstream-5xx": "上游服务端错误（5xx）",
+  "empty-stream": "上游空回复被掐断，触发客户端自动重试",
+  delete: "删除 Key",
+  edit: "编辑 Key",
+  config: "配置变更",
+  refresh: "批量刷新额度（手动触发）",
+  fallback: "Go 无可用 Key，请求转备用通道",
+  "fallback:start": "备用周期开始（备用通道接管请求）",
+  "fallback:end": "备用周期结束（切回 Go 并结算花费）",
+  "fallback:fail": "备用通道请求失败",
+  "fallback-test": "备用通道测试连接",
+};
 
 function renderEvents() {
-  const sel = $("#evType");
-  if (sel.options.length <= 1) {
-    sel.innerHTML = `<option value="">全部类型</option>` + EV_TYPES.map((t) => `<option value="${t}">${t}</option>`).join("");
-  }
-  const filter = sel.value;
+  const filter = state.evFilter || "";
   const list = filter ? state.events.filter((e) => e.type === filter) : state.events;
   const ul = $("#evList");
   ul.innerHTML = list.length ? list.map((e) => `<li>
     <span class="t">${fmtTs(e.ts)}</span>
-    <span class="tag ${esc(e.type)}">${esc(e.type)}</span>
+    <span class="tag ${esc(e.type)}" title="${esc(EV_EXPLAIN[e.type] || "")}">${esc(e.type)}</span>
     <span><b>${esc(e.keyId || "—")}</b> · ${esc(e.detail)}</span>
   </li>`).join("") : `<li style="grid-template-columns:1fr;color:var(--muted)">暂无事件</li>`;
+}
+
+// ---------- 自绘下拉（玻璃主题，替代原生 select 的系统弹层） ----------
+// 弹层挂 document.body（fixed 定位）：彻底脱离卡片的 overflow:hidden 与 backdrop-filter
+// 层叠上下文，不会被任何卡片裁剪/遮挡；位置由 JS 按按钮实时计算，下方空间不足时向上弹。
+let ddOpenClose = null; // 当前打开的下拉的关闭函数（全局唯一）
+function ddCloseAll() { if (ddOpenClose) { ddOpenClose(); ddOpenClose = null; } }
+
+function makeDD(mount, opts, initial, onChange) {
+  if (!mount) return { get: () => initial, set: () => {} };
+  let value = initial;
+  mount.classList.add("dd");
+  mount.innerHTML = `<button type="button" class="dd-btn"></button><span class="dd-caret" aria-hidden="true"></span>`;
+  const btn = mount.querySelector(".dd-btn");
+  const caret = mount.querySelector(".dd-caret");
+  if (caret) btn.appendChild(caret); // 箭头放按钮内，随按钮态旋转
+  const pop = document.createElement("div");
+  pop.className = "dd-pop";
+  document.body.appendChild(pop);
+  const labelOf = (v) => { const o = opts.find((x) => x.v === v); return o ? o.label : v; };
+  const syncBtn = () => { const c = btn.querySelector(".dd-caret"); btn.textContent = labelOf(value) || "—"; if (c) btn.appendChild(c); };
+  const place = () => {
+    const r = btn.getBoundingClientRect();
+    const pw = pop.offsetWidth, ph = pop.offsetHeight;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    let top = r.bottom + 6;
+    if (top + ph > vh - 8 && r.top - ph - 6 >= 8) top = r.top - ph - 6; // 下方放不下且上方更宽裕 → 向上弹
+    const left = Math.min(Math.max(8, r.left), Math.max(8, vw - pw - 8));
+    pop.style.top = Math.max(8, top) + "px";
+    pop.style.left = left + "px";
+    pop.style.minWidth = r.width + "px";
+  };
+  const close = () => { pop.classList.remove("show"); mount.classList.remove("open"); };
+  const open = () => {
+    ddCloseAll();
+    pop.innerHTML = opts.map((o) => `<div class="dd-opt${o.v === value ? " sel" : ""}" data-v="${esc(o.v)}"><span class="dd-label">${esc(o.label)}</span>${o.note ? `<span class="dd-note">${esc(o.note)}</span>` : ""}</div>`).join("");
+    pop.classList.add("show");
+    mount.classList.add("open");
+    place();
+    ddOpenClose = close;
+  };
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (pop.classList.contains("show")) ddCloseAll(); else open();
+  });
+  pop.addEventListener("click", (e) => {
+    const opt = e.target.closest(".dd-opt");
+    if (!opt) return;
+    e.stopPropagation();
+    value = opt.dataset.v;
+    syncBtn();
+    ddCloseAll();
+    if (onChange) onChange(value);
+  });
+  window.addEventListener("scroll", () => { if (pop.classList.contains("show")) place(); }, true);
+  window.addEventListener("resize", () => { if (pop.classList.contains("show")) place(); });
+  syncBtn();
+  return { get: () => value, set: (v) => { value = v; syncBtn(); } };
 }
 
 function renderSettings() {
@@ -258,21 +456,25 @@ function renderSettings() {
     <dt>状态更新时间</dt><dd>${fmtTs(st && st.stateUpdatedAt)}</dd>`;
 
   const c = state.config || {};
-  $("#cfgPoll").value = Math.round((c.pollIntervalMs || 900000) / 60000);
-  $("#cfgPre").value = c.preSwitchPct ?? 90;
-  $("#cfgConc").value = c.concurrencyPerKey ?? 5;
-  $("#cfgSticky").checked = c.stickyEnabled !== false;
-  $("#cfgRetryEmpty").checked = c.retryEmptyResponse !== false;
-  $("#cfgToken").value = "";
+  // 表单显示当前生效配置（编辑中不覆盖）；本地 token 不回显，用占位符表明状态
+  if (!cfgDirty) {
+    $("#cfgPoll").value = Math.round((c.pollIntervalMs || 900000) / 60000);
+    $("#cfgConc").value = c.concurrencyPerKey ?? 5;
+    $("#cfgSticky").checked = c.stickyEnabled !== false;
+    $("#cfgRetryEmpty").checked = c.retryEmptyResponse !== false;
+    $("#cfgToken").value = "";
+  }
+  $("#cfgToken").placeholder = c.localToken === "(set)" ? "已设置（输入新值替换，留空即清除）" : "未设置（≥4 字符）";
+}
 
-  $("#zcodeGuide").textContent =
-`# 一次性的 ZCode 模型配置改动（主方案 §3.3）
-# 文件：C:\\Users\\duanz\\.zcode\\v2\\config.json
-# provider ce6a858a-5fad-4118-ba2b-b08bbde2c8d7:
-#   options.baseURL: https://opencode.ai/zen/go/v1  ->  http://127.0.0.1:8788/v1
-#   options.apiKey:  <占位符，如 sk-local-gateway>
-# 另保留一个 disabled 的逃生门 provider（真实 baseURL + 单 Key）。
-# 改配置后需新建会话 / 重启 ZCode 生效（Key 在 provider 构造时固化）。`;
+// Agent 对接指引：由网关运行时生成（注入本机安装目录与端口），前端只负责展示与复制
+async function loadAgentGuide() {
+  try {
+    const r = await api("/api/guide");
+    $("#agentGuide").textContent = r.prompt || "（指引为空）";
+  } catch {
+    $("#agentGuide").textContent = "（获取指引失败，请刷新页面重试）";
+  }
 }
 
 // ---------- 主题化弹层（替换原生 confirm/prompt） ----------
@@ -348,6 +550,23 @@ async function actReactivate(id) {
   refreshAll(true);
 }
 
+// 隔离区「一键恢复」：手动点击 = 全部 Key 重查一次，隔离区额度已恢复的自动放回池
+async function actReactivateAll() {
+  const btn = $("#btnReactivateAll");
+  btn.disabled = true; btn.textContent = "恢复中…";
+  try {
+    const r = await api("/api/keys/reactivate-all", { method: "POST" });
+    const list = r.results || [];
+    const okN = list.filter((x) => x.ok).length;
+    const revived = list.filter((x) => x.revived).length;
+    if (revived) toast(`已全部重查 ${list.length} 个 Key，恢复 ${revived} 个隔离 Key`);
+    else if (okN === list.length) toast(`已全部重查 ${list.length} 个 Key`);
+    else toast(`已重查 ${okN}/${list.length} 个 Key（${list.length - okN} 个失败：仍限/401）`);
+  } catch (e) { toast("恢复失败：" + e.message, true); }
+  btn.disabled = false; btn.textContent = "一键恢复";
+  refreshAll(true);
+}
+
 async function actDelete(id) {
   const k = state.keys.find((x) => x.id === id);
   if (!(await uiDialog({ title: "彻底删除", message: `彻底删除 Key「${k ? k.label : id}」？此操作不可恢复。`, confirmText: "删除", danger: true }))) return;
@@ -390,14 +609,13 @@ async function saveConfig(e) {
   e.preventDefault();
   const body = {
     pollIntervalMs: Math.max(5, Math.min(60, Number($("#cfgPoll").value) || 15)) * 60000,
-    preSwitchPct: Number($("#cfgPre").value) || 90,
     concurrencyPerKey: Number($("#cfgConc").value) || 5,
     stickyEnabled: $("#cfgSticky").checked,
     retryEmptyResponse: $("#cfgRetryEmpty").checked,
   };
   const tok = $("#cfgToken").value.trim();
   if (tok) body.localToken = tok; else body.localToken = "";
-  try { await api("/api/config", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("参数已保存"); }
+  try { await api("/api/config", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("参数已保存"); cfgDirty = false; }
   catch (err) { toast(err.message, true); }
   refreshAll(true);
 }
@@ -412,7 +630,7 @@ function switchView(name) {
 // ---------- 轮询 ----------
 function setupPolling() {
   clearInterval(pollTimer);
-  const iv = Number($("#refreshInterval").value);
+  const iv = Number(refreshDD.get());
   if ($("#autoRefresh").checked && iv > 0) pollTimer = setInterval(() => refreshAll(true), iv);
 }
 
@@ -435,9 +653,22 @@ document.addEventListener("click", async (e) => {
 
 $("#addKeyForm").addEventListener("submit", addKey);
 $("#configForm").addEventListener("submit", saveConfig);
+$("#fallbackForm").addEventListener("submit", saveFallback);
+$("#btnFbTest").addEventListener("click", testFallback);
+$("#btnFbRefresh").addEventListener("click", refreshFallbackCost);
+$("#fallbackForm").addEventListener("input", () => { fbDirty = true; });
+$("#fallbackForm").addEventListener("change", () => { fbDirty = true; });
+$("#fbWindows").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-win]");
+  if (!b) return;
+  fbWin = b.dataset.win;
+  renderFallback();
+});
 $("#btnRefresh").addEventListener("click", actRefreshAll);
+$("#btnReactivateAll").addEventListener("click", actReactivateAll);
 $("#autoRefresh").addEventListener("change", setupPolling);
-$("#refreshInterval").addEventListener("change", setupPolling);
+$("#configForm").addEventListener("input", () => { cfgDirty = true; });
+$("#configForm").addEventListener("change", () => { cfgDirty = true; });
 $("#toggleNewKey").addEventListener("click", () => {
   const i = $("#newKey");
   i.type = i.type === "password" ? "text" : "password";
@@ -459,11 +690,26 @@ $("#btnExport").addEventListener("click", async () => {
   } catch (err) { toast(err.message, true); }
 });
 $("#btnCopyGuide").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText($("#zcodeGuide").textContent); toast("已复制"); }
+  try { await navigator.clipboard.writeText($("#agentGuide").textContent); toast("已复制"); }
   catch { toast("复制失败", true); }
 });
-$("#evType").addEventListener("change", () => renderEvents());
+
+// ---------- 自绘下拉初始化 + 全局关闭（ddCloseAll 定义于 makeDD 上方） ----------
+document.addEventListener("click", ddCloseAll);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") ddCloseAll(); });
+
+const refreshDD = makeDD($("#refreshDD"), [
+  { v: "30000", label: "30s" }, { v: "60000", label: "1min" }, { v: "300000", label: "5min" }, { v: "0", label: "关" },
+], "60000", () => setupPolling());
+const evDD = makeDD($("#evTypeDD"),
+  [{ v: "", label: "全部类型" }].concat(EV_TYPES.map((t) => ({ v: t, label: t, note: EV_EXPLAIN[t] }))),
+  "", (v) => { state.evFilter = v; renderEvents(); });
+const fbBillingDD = makeDD($("#fbBillingDD"), [
+  { v: "balance", label: "自动计费", note: "DeepSeek 官方余额差值" },
+  { v: "none", label: "不计费", note: "其他 OpenAI 端点" },
+], "balance");
 
 // ---------- 启动 ----------
 refreshAll(true);
+loadAgentGuide();
 setupPolling();

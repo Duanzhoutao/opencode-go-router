@@ -25,12 +25,7 @@
     <span id="gwDot" class="dot" title="网关状态">●</span>
     <label class="autorefresh">
       <input type="checkbox" id="autoRefresh" checked> 自动刷新
-      <select id="refreshInterval">
-        <option value="30000">30s</option>
-        <option value="60000" selected>1min</option>
-        <option value="300000">5min</option>
-        <option value="0">关</option>
-      </select>
+      <span id="refreshDD"></span>
     </label>
     <button id="btnRefresh" class="btn" title="立即刷新全部 Key 额度（重查 /usage）">立即刷新</button>
   </div>
@@ -41,6 +36,7 @@
   <button data-view="keys" class="tab">Key 管理</button>
   <button data-view="quarantine" class="tab">隔离区</button>
   <button data-view="sessions" class="tab">会话绑定</button>
+  <button data-view="fallback" class="tab">备用通道</button>
   <button data-view="events" class="tab">事件日志</button>
   <button data-view="settings" class="tab">设置</button>
 </nav>
@@ -53,7 +49,7 @@
     <div class="stat-row" id="statCards"></div>
     <div class="key-grid" id="keyGrid"></div>
     <div id="overviewEmpty" class="empty hidden">
-      还没有 Key。去 <button class="btn link" data-goto="keys">Key 管理</button> 添加一把，或进入 隔离区 管理废弃 Key。
+      还没有 Key——去 <button class="btn link" data-goto="keys">Key 管理</button> 添加一把。
     </div>
   </section>
 
@@ -67,8 +63,8 @@
         <input id="newLabel" placeholder="显示名称（如：主力）" autocomplete="off">
         <button class="btn primary" type="submit">添加并校验</button>
       </div>
-      <p class="hint">提交后网关立即调用 <code>/usage</code> 校验：有效 Key 回填三窗口并置为 active；无效 Key（401）拒绝录入。</p>
-      <p class="hint warn-hint hidden" id="samePoolHint">⚠️ 录入 Key 与既有 Key 属于同一 workspace（共享额度池，轮换无效）——如非独立订阅请谨慎。</p>
+      <p class="hint" title="提交后网关立即调用 /usage 校验：有效 Key 回填 5h/周/月三窗口额度并启用；无效 Key（401）拒绝录入。">提交时自动校验，无效 Key 拒绝录入。</p>
+      <p class="hint warn-hint hidden" id="samePoolHint">⚠️ 与既有 Key 同池（共享额度，轮换无效）——非独立订阅请谨慎。</p>
     </form>
     <div class="card">
       <h2>Key 列表</h2>
@@ -79,18 +75,82 @@
   <!-- 隔离区 -->
   <section id="view-quarantine" class="view">
     <div class="card">
-      <h2>隔离区（quarantined / invalid）</h2>
-      <p class="hint">月限耗尽或认证失效的 Key 不硬删除，单独存放、排除出调度与轮询。复活需要续订 Go 订阅（新月周期重置月窗口）——<strong>充 Zen 余额不重置 $60 配额、不延期</strong>。</p>
-      <table class="tbl" id="qTable"><thead><tr><th>显示名</th><th>Key</th><th>状态</th><th>废弃原因</th><th>废弃时间</th><th>monthly resetsAt</th><th>操作</th></tr></thead><tbody></tbody></table>
+      <div class="events-head">
+        <h2>隔离区</h2>
+        <button class="btn primary" id="btnReactivateAll" title="重查全部 Key 额度，恢复的自动回池">一键恢复</button>
+      </div>
+      <p class="hint">额度用尽或失效的 Key 在这里停用，不参与调度。<strong>充 Zen 余额不重置月度配额，需续订 Go 订阅。</strong></p>
+      <details class="mech">
+        <summary>机制说明</summary>
+        <div class="mech-body">
+          月限 Key 在续费日过后自动复查额度：恢复则自动回池，仍未恢复则标记「未续订」停止复查。续订后也可点「一键查询」立即重查，或逐行「重新激活」。5h / 周限冷却的 Key 到点自动恢复，无需处理。
+        </div>
+      </details>
+      <table class="tbl" id="qTable"><thead><tr><th>显示名</th><th>Key</th><th>状态</th><th>废弃原因</th><th>废弃时间</th><th>月窗重置</th><th>操作</th></tr></thead><tbody></tbody></table>
     </div>
   </section>
 
   <!-- 会话绑定 -->
   <section id="view-sessions" class="view">
     <div class="card">
-      <h2>会话绑定表</h2>
-      <p class="hint">哪个 <code>x-session-id</code> 粘在哪个 Key：缓存按 workspace 累积，健康绑定绝不动。两个会话绑同一 Key（同池）会有提示。</p>
-      <table class="tbl" id="sessTable"><thead><tr><th>x-session-id</th><th>绑定 Key</th><th>模型</th><th>请求数</th><th>最后活动</th></tr></thead><tbody></tbody></table>
+      <h2>会话绑定</h2>
+      <p class="hint" title="按 x-session-id 把会话固定到同一把 Key（缓存按 workspace 累积，健康绑定绝不迁移）；两个会话绑同一把 Key（同池）会有提示。">同一会话固定用同一把 Key，以积累缓存。</p>
+      <table class="tbl" id="sessTable"><thead><tr><th>会话 ID</th><th>绑定 Key</th><th>模型</th><th>请求数</th><th>最后活动</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- 备用通道 -->
+  <section id="view-fallback" class="view">
+    <div class="card">
+      <div class="events-head">
+        <h2>备用通道</h2>
+        <span id="fbActiveBadge" class="badge status-quarantined hidden">备用中</span>
+      </div>
+      <p class="hint">所有 Key 都不可用时自动切到这里，恢复后自动切回。</p>
+      <details class="mech">
+        <summary>机制说明</summary>
+        <div class="mech-body">
+          Key 的 5h / 周 / 月任一窗口打满即不可用；手动停用与失效 Key 不计入。兜底请求的模型一律改写为下方配置的模型，客户端无感知。计费：DeepSeek 官方支持按余额差值自动计费，其他端点选「不计费」。
+        </div>
+      </details>
+      <form id="fallbackForm" class="form-col">
+        <label class="inline"><input type="checkbox" id="fbEnabled"> 启用备用通道</label>
+        <label>名称<input type="text" id="fbLabel" placeholder="官方 DeepSeek" autocomplete="off"></label>
+        <label>Base URL<input type="text" id="fbBaseURL" placeholder="https://api.deepseek.com（留空用官方）" autocomplete="off">
+          <span class="field-note">支持任何 OpenAI 兼容端点（DeepSeek 官方、火山方舟等）</span></label>
+        <label>API Key<input type="password" id="fbApiKey" placeholder="sk-…（已保存则留空保持不变）" autocomplete="off">
+          <span class="field-note">仅存本机，不回显</span></label>
+        <label>模型名<input type="text" id="fbModel" placeholder="deepseek-v4-flash-vision-exp（兜底时所有请求都改用此模型）" autocomplete="off"></label>
+        <label>计费模式
+          <div id="fbBillingDD"></div>
+        </label>
+        <div class="form-row">
+          <button class="btn primary" type="submit">保存配置</button>
+          <button class="btn" type="button" id="btnFbTest">测试连接</button>
+        </div>
+      </form>
+      <p class="hint" id="fbTestResult"></p>
+    </div>
+    <div class="card" id="fbCostCard">
+      <div class="events-head">
+        <h2 title="金额 = 相邻余额采样点差值累加（15 分钟采样 + 立刻计算补点，只计下降）；不计费模式只显示次数。">费用</h2>
+        <button class="btn" id="btnFbRefresh" title="立即查询余额并重算差值">立刻计算</button>
+      </div>
+      <p class="hint">备用期间消耗的是该上游账户余额（按量计费）。</p>
+      <div class="stat-row" id="fbCostMain"></div>
+      <div class="filters" id="fbWindows">
+        <button class="btn small primary" data-win="h24">近24小时</button>
+        <button class="btn small" data-win="d7">近一周</button>
+        <button class="btn small" data-win="d14">近两周</button>
+        <button class="btn small" data-win="d30">近一个月</button>
+      </div>
+      <p class="hint" id="fbWindowDetail"></p>
+    </div>
+    <div class="card">
+      <h2>结算记录</h2>
+      <table class="tbl" id="fbSettleTable"><thead><tr><th>开始</th><th>结束</th><th>起始余额</th><th>结束余额</th><th>消耗</th><th>方式</th></tr></thead><tbody></tbody></table>
+      <h2 style="margin-top:18px" title="每次兜底请求的 token 用量，仅参考，不参与金额计算。">兜底明细</h2>
+      <ul class="evlist" id="fbCosts"></ul>
     </div>
   </section>
 
@@ -100,7 +160,7 @@
       <div class="events-head">
         <h2>事件日志</h2>
         <div class="filters">
-          <select id="evType"><option value="">全部类型</option></select>
+          <div id="evTypeDD"></div>
           <button class="btn small" id="btnClearEvents">清空</button>
         </div>
       </div>
@@ -116,19 +176,25 @@
     </div>
     <div class="card">
       <h2>运行参数</h2>
+      <p class="hint">表单中显示的即当前生效配置，修改后点「保存参数」。</p>
       <form id="configForm" class="form-col">
-        <label>/usage 轮询间隔（分钟，5–60）<input type="number" id="cfgPoll" min="5" max="60" step="1"></label>
-        <label>预切换阈值 %（rolling/weekly/monthly 达此值提前迁移）<input type="number" id="cfgPre" min="0" max="100" step="1"></label>
-        <label>每 Key 并发上限（1–8）<input type="number" id="cfgConc" min="1" max="8" step="1"></label>
-        <label class="inline"><input type="checkbox" id="cfgSticky"> 启用 x-session-id 粘性</label>
-        <label class="inline"><input type="checkbox" id="cfgRetryEmpty"> 空回复重试优化（缓冲至首个正文；上游返回空流 → 零字节掐断 → 触发 ZCode 自动重发）</label>
-        <label>本地访问 token（≥4 字符，留空清除；设置后转发面与控制面需 Bearer）<input type="password" id="cfgToken" autocomplete="off"></label>
+        <label>额度轮询间隔（分钟）<input type="number" id="cfgPoll" min="5" max="60" step="1">
+          <span class="field-note">定时重查各 Key 的 5h / 周 / 月额度，5–60 分钟</span></label>
+        <label>每 Key 并发上限（1–8）<input type="number" id="cfgConc" min="1" max="8" step="1">
+          <span class="field-note">同一把 Key 同时转发的请求数上限</span></label>
+        <label class="inline"><input type="checkbox" id="cfgSticky"> 会话粘性（固定同一 Key）</label>
+        <span class="field-note inline-note">按 x-session-id 把同一会话固定到同一把 Key，保住上游缓存</span>
+        <label class="inline"><input type="checkbox" id="cfgRetryEmpty"> 空回复重试优化</label>
+        <span class="field-note inline-note">上游长思考后返回空流时掐断连接，触发 ZCode 按网络错误自动重发，避免空回复卡死对话</span>
+        <label>本地访问 token<input type="password" id="cfgToken" autocomplete="off">
+          <span class="field-note">≥4 字符，留空清除；设置后所有接口需 Bearer 访问</span></label>
         <button class="btn primary" type="submit">保存参数</button>
       </form>
     </div>
     <div class="card">
-      <h2>ZCode 对接指引（一次性）</h2>
-      <pre class="codeblock" id="zcodeGuide"></pre>
+      <h2>Agent 对接指引</h2>
+      <p class="hint">复制下面的提示词发给你的 AI 助手：它会阅读网关源码，帮你把客户端接入网关，并评估能否启用跟随启动（Agent 启动时自动拉起网关）。</p>
+      <pre class="codeblock" id="agentGuide">（加载中…）</pre>
       <button class="btn small" id="btnCopyGuide">复制</button>
     </div>
     <div class="card">

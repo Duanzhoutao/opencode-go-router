@@ -278,7 +278,7 @@ main {
 .kc-actions .btn { padding: 3px 8px; font-size: 13px; }
 .kc-key { color: var(--ink-soft); margin-top: 4px; font-family: var(--mono); font-size: 12px; position: relative; z-index: 1; }
 .quota-bars { margin: 12px 0 10px; display: flex; flex-direction: column; gap: 7px; position: relative; z-index: 1; }
-.qbar-row { display: grid; grid-template-columns: 38px 1fr 104px; align-items: center; gap: 9px; font-size: 12px; }
+.qbar-row { display: grid; grid-template-columns: 38px 1fr 124px; align-items: center; gap: 9px; font-size: 12px; }
 .qbar-label { color: var(--ink-soft); font-family: var(--serif); font-weight: 600; }
 .qbar-track {
   height: 9px; border-radius: 99px; background: rgba(120,85,40,0.1);
@@ -325,6 +325,53 @@ main {
 }
 .hint { color: var(--ink-soft); font-size: 12.5px; margin: 8px 0 0; line-height: 1.6; }
 .warn-hint { color: var(--danger); }
+/* L4 机制说明：默认收起的折叠块（多句解释的统一去处） */
+details.mech { margin: 8px 0 0; font-size: 12px; }
+details.mech > summary { cursor: pointer; user-select: none; color: var(--muted); list-style: none; }
+details.mech > summary::before { content: "ⓘ "; }
+details.mech > summary::-webkit-details-marker { display: none; }
+details.mech[open] > summary { color: var(--ink-soft); }
+details.mech .mech-body { color: var(--ink-soft); line-height: 1.7; padding: 6px 0 0 2px; }
+/* L3 字段小字：跟在输入框下方的单句提示 */
+.field-note { display: block; color: var(--muted); font-size: 11.5px; line-height: 1.5; }
+.form-col .field-note.inline-note { margin: -8px 0 0 26px; }
+
+/* 自绘下拉（玻璃主题，替代原生 select 的系统弹层） */
+.dd { position: relative; display: inline-block; }
+.dd-btn {
+  font-family: var(--sans); font-size: 12.5px; text-align: left;
+  background: var(--glass-strong); color: var(--ink);
+  border: 1px solid var(--glass-edge); border-radius: 9px;
+  padding: 7px 30px 7px 10px; cursor: pointer; position: relative;
+  backdrop-filter: blur(8px);
+  transition: border-color .2s, box-shadow .2s;
+}
+.dd-btn:hover, .dd.open .dd-btn { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(200,134,45,0.14); }
+.dd-caret {
+  position: absolute; right: 10px; top: 50%; width: 8px; height: 8px;
+  border-right: 1.6px solid var(--ink-soft); border-bottom: 1.6px solid var(--ink-soft);
+  transform: translateY(-70%) rotate(45deg); transition: transform .18s;
+}
+.dd.open .dd-caret { transform: translateY(-20%) rotate(225deg); }
+/* 弹层挂 body（脱离卡片的 overflow/层叠上下文），fixed 定位由 JS 按按钮位置计算 */
+.dd-pop {
+  position: fixed; z-index: 500;
+  min-width: 96px; max-width: 380px; max-height: 320px; overflow: auto;
+  display: none; padding: 6px;
+  background: var(--glass-strong); border: 1px solid var(--glass-edge); border-radius: 12px;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 12px 32px rgba(58,46,34,.20);
+}
+.dd-pop.show { display: block; }
+.dd-opt {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 14px;
+  padding: 7px 12px; border-radius: 8px; cursor: pointer;
+  font-size: 12.5px; color: var(--ink); white-space: nowrap;
+}
+.dd-opt:hover { background: rgba(255,255,255,.5); }
+.dd-opt.sel { color: var(--accent); font-weight: 600; }
+.dd-opt .dd-note { color: var(--muted); font-size: 11px; }
+.dd-opt.sel .dd-note { color: var(--ink-soft); }
 .form-row { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; }
 .form-row input { flex: 1 1 220px; }
 .form-row input#newLabel { flex: 0 1 180px; }
