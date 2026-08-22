@@ -21,3 +21,10 @@ keys.json
 # 临时产物
 *.tmp
 *.bak
+
+# 本机项目政策与内部文档（保留在本地，不入开源仓库）
+AGENTS.md
+PROJECT_STATUS.md
+project-context/
+docs/plans/opencode-go-router-implementation-plan-2026-08-22.md
+docs/plans/opencode-go-router-goal-prompt-2026-08-22.md

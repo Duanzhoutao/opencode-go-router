@@ -1,117 +1,210 @@
-# OpenCode Go 多 Key 本地路由 + ZCode 集成
+# OpenCode Go Router
 
-**一句话**：本地 Node 网关（127.0.0.1:8788）持有多个 OpenCode Go Key，以 `x-session-id` 做会话粘性 + 周限额优先级调度 + `/usage` 精确 `resetsAt` 回收 + 月限隔离/复活，对 ZCode 完全透明（唯一一次性改动 = baseURL 指向网关），跟随 ZCode 启停，配浏览器仪表盘。
+**多 Key 本地路由网关**：一个本机 Node 进程持有多个 OpenCode Go Key，对 OpenAI 兼容的 Agent 客户端（ZCode / OpenCode / Claude Code 生态）呈现为一个普通 `127.0.0.1` provider——按会话粘性 + 限额调度自动选 Key，Key 用尽自动切换/隔离，零依赖、零改造接入。
 
-本工作区是本设计的**唯一归属地**。此前在 Me 工作区经六轮迭代完成的设计、决策与实测证据已全部迁移至此（Me 侧原文件为移交副本，不再作为归属入口）。
+> ⚠️ 非官方项目，与 opencode.ai 无任何关联。「OpenCode Go」是其付费订阅产品，本仓库只做本地 Key 配额管理。
 
-## Project System
+## 为什么需要它
 
-- Current stage: 项目引导 + 文档迁移完成；设计定稿，**网关代码未实现**（MVP 待用户确认决策点后由后续任务实现）
-- Project type: 个人工具（本地 Node 网关 + ZCode 集成，零重依赖）
-- Memory profile: `status-log`
-- Dynamic status: `PROJECT_STATUS.md`
-- Archival subfolder: `project-context/`（归档命名规范见下文）
+OpenCode Go 订阅的每个 Key 有 **5 小时滚动 / 每周 / 每月** 三重用量窗口，用满即被上游 429 限流。而 Agent 客户端（如 ZCode）只能配一个固定的 baseURL + 一个 Key：
 
-## 文件职责（3 个核心文件）
+- 单个 Key 用满 → 请求被 429 拒绝，AI 工具直接不可用；
+- 多个 Key 想轮换 → 手工切配置麻烦，且会打断会话的模型缓存；
+- 不知道哪个 Key 还有额度 → 全靠猜；
+- 多 Key 可能**共享同一个额度池**（同 workspace），轮换无效。
 
-| 文件 | 写什么 |
-| --- | --- |
-| `AGENTS.md` | 核心规则：项目政策文件清单、任务收尾自检、归档触发、兜底默认 |
-| `README.md`（本文件） | 项目全貌：目标、结构、设计文档索引、归档命名规范 |
-| `PROJECT_STATUS.md` | 当前目标 + 倒叙详细日志 + 重要约束 + 已压缩摘要（底部摘要栈） |
+网关把这一切封装掉：客户端只连网关，网关粘住会话、按限额挑选 Key、用尽自动 failover 与隔离，并提供浏览器仪表盘观察所有 Key 的真实用量。
 
-## 设计文档索引（决策源，勿删减改写）
+## 特性
 
-| 文件 | 内容 |
-|---|---|
-| `docs/plans/opencode-go-key-router-2026-08-22.md` | **主方案（唯一决策源）**：问题 P1-P9 / 核心逻辑 L1-L8 / 解决方案（架构·文件布局·ZCode 对接·选型·分期）+ §3.6 待确认决策点 4 个 + §3.7 开放项 V1-V6 与已接受风险 |
-| `docs/plans/opencode-go-router-evidence-2026-08-22.md` | 实测证据链（外挂）：API 实测（/usage、429、401、/models）、asar 反编译、model-io 日志验证、dt-guard 模式实证、缓存调研、参考项目、复现命令 |
-| `docs/reports/opencodego-claude-code-feasibility-2026-08-04.md` | 历史可行性调研（2026-08-04）：Claude Code 接入 Go 套餐的端点/协议/参考代理 |
-| `docs/plans/opencode-go-router-ui-architecture-2026-08-22.md` | 设计细化（UI/后端规格）：前端功能清单（六视图本地单页）+ 后端架构（模块/控制面 API 契约/存储 schema/数据流）+ 真实探测结果 + MOCK_MODE 模拟方案 |
-| `docs/plans/opencode-go-router-implementation-plan-2026-08-22.md` | 实施细节计划（敲定版）：技能使用清单、内置浏览器测试方案、ZCode 模型配置真实接入测试步骤、实现顺序、验收标准 |
-| `docs/plans/opencode-go-router-goal-prompt-2026-08-22.md` | 目标提示词（Goal-Mode）：可直接设定为持续执行目标，指导 MVP 实现与真实跑通 |
+- **会话粘性（`x-session-id`）**：同一会话永远走同一 Key，模型上下文缓存不因轮换失效；跨会话自动分配到不同 Key。
+- **限额感知调度**：每 15 分钟轮询 `/usage` 三窗口用量（5h 滚动 / 周 / 月，含 `resetsAt`），按「周剩余最多」优先出 Key；窗口将尽（可配置阈值）提前迁移到富余 Key；月限用尽的 Key 自动隔离，月窗重置后自动复活。
+- **透明 failover**：上游 429/5xx 时缓冲首字节后自动换下一个可用 Key（failoverChain 兜底），对客户端无感知。
+- **同池检测**：从 429 响应 metadata 提取 workspace id，同 workspace 的 Key 标记「同池」并告警——提示轮换它们无效。
+- **状态机管理**：`active / cooldown_rolling / cooldown_weekly / quarantined / invalid` 五态 + 冷却截止时间，支持手动停用、删除、复活、隔离。
+- **浏览器仪表盘**：六视图单页（总览 / Key 管理 / 隔离区 / 会话绑定 / 事件日志 / 设置），暖棕奶油白主题、原生控件主题化、用量进度条三档分色（绿 <90% / 金 ≥90% / 红 ≥100%）。
+- **可选本地鉴权**：`localToken` 设置后，转发面与控制面都要求 `Bearer` 头，防止本机其他进程借用网关。
+- **每 Key 并发上限**（默认 5）与丢缓存保护。
+- **零依赖**：Node 原生 `http/https`，无 `npm install`，无构建链。
+- **MOCK 模式**：合成数据覆盖全部状态，前端开发/演示开箱即用。
 
-> ⚠️ 开工前必读：主方案 `docs/plans/opencode-go-key-router-2026-08-22.md` 的 **§3.6 待用户确认的 4 个决策点**（多 Key 是否独立 workspace / 排序方向 / 储备策略 / 每 Key 并发上限）与 **§3.7 开放项 V1-V6**（failover 端到端 / 缓存实测 / 同池检测 / 子智能体 header / rolling resetsAt 语义 / /usage 稳定性）需用户确认或实现后实证。
+## 快速开始
 
-## 已知风险与待验证点（排查入口）
+### 1. 启动网关
 
-> 以后遇到「网关表现异常 / 模型表现怪 / 质量不对」先看这张表，按「位置」列点进详细文档。
+要求：Node.js ≥ 18（作者环境 24）。
 
-| 风险 / 待验证 | 结论或状态 | 位置 |
+```bash
+# Linux / macOS
+git clone <repo-url>
+cd opencode-go-router
+node go-gateway.cjs
+
+# Windows（PowerShell 或 cmd 均可）
+git clone <repo-url>
+cd opencode-go-router
+node go-gateway.cjs
+```
+
+启动后打开浏览器访问 <http://127.0.0.1:8788>（仪表盘）。
+
+### 2. 录入 OpenCode Go Key
+
+在仪表盘「Key 管理」页粘贴 Key（`sk-...`）与显示名即可；也可用 API：
+
+```bash
+curl -s -X POST http://127.0.0.1:8788/api/keys \
+  -H "Content-Type: application/json" \
+  -d '{"key": "sk-你的GoKey", "label": "主 Key"}'
+```
+
+录 Key 时网关会用该 Key 调一次 `https://opencode.ai/zen/go/v1/usage` 做真实校验（401 → 无效 Key；成功 → 录入并带出三窗口用量）。
+
+### 3. 验证网关
+
+```bash
+# 模型列表透传（Agent 启动探测用）
+curl http://127.0.0.1:8788/v1/models
+
+# 真实对话（OpenAI 协议，支持 SSE 流式）
+curl -s http://127.0.0.1:8788/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "x-session-id: demo-session" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}]}'
+```
+
+### 4. 接入 Agent 客户端
+
+对客户端而言，网关就是一个 OpenAI 兼容 endpoint：
+
+| 客户端 | 配置位置 | baseURL | apiKey |
+|---|---|---|---|
+| **ZCode** | `~/.zcode/v2/config.json` 的 `provider` 块 | `http://127.0.0.1:8788/v1` | 任意占位符（建议 `sk-local-gateway`） |
+| **OpenCode**（原生） | `~/.config/opencode/opencode.json` 的 `provider` 块 | `http://127.0.0.1:8788/v1` | 任意占位符（建议 `sk-local-gateway`） |
+| 任何 OpenAI 兼容客户端 | baseURL 指向网关 | `http://127.0.0.1:8788/v1` | 任意占位符 |
+
+#### ZCode 配置示例（Provider）
+
+编辑 `~/.zcode/v2/config.json`，在 `provider` 对象中加/改一条：
+
+```jsonc
+{
+  "provider": {
+    "opencodego": {
+      "name": "OpenCodeGo",
+      "options": {
+        "baseURL": "http://127.0.0.1:8788/v1",
+        "apiKey": "sk-local-gateway"
+      }
+    }
+  }
+}
+```
+
+要点：
+
+- **`baseURL` 必须以 `/v1` 结尾**——网关在这个后缀上暴露 OpenAI 协议面（`/v1/chat/completions`、`/v1/models`）。
+- **`apiKey` 是占位符**。网关不关心这里填什么（填任何非空字符串即可），因为真实的 Go Key 由网关内部持有并按调度使用；填 `sk-local-gateway` 是惯例，用来一眼认出「这个 provider 走本地网关」。
+- **不需要在客户端里配模型列表**：网关把上游的 `/v1/models` 原样透传，客户端启动探测自动发现模型与思考档位。
+- **保留直连逃生门**：建议把原来的直连 provider（`https://opencode.ai/zen/go/v1`）保留一份并置为 disabled，出问题时改回 baseURL 即可秒切。
+
+#### ZCode 的模型选择
+
+在 ZCode 模型列表的 provider 一栏选 `OpenCodeGo`（或对应 id）。模型 id 沿用 Go 套餐模型（如 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` / `ox-alpha-free`），无需额外配置。
+
+## 调度与状态机（半页版）
+
+```
+录入 -> active（可用）
+  |-- /usage 轮询或 429 触发 --> cooldown_rolling（5h 窗口冷却）
+  |---------------------------> cooldown_weekly（周窗口冷却）
+  |---------------------------> quarantined（月限隔离，月窗重置自动复活）
+  |-- 401/退订 --------------------> invalid（无效，需手动删除）
+```
+
+选 Key 优先级：会话已绑定的 Key（粘性）> 周剩余最多 > 同 Key 其他空闲并发 > failover 链兜底。每 Key 并发上限默认 5（可在设置页调 1–8）。详细设计与决策记录见 [docs/plans](docs/plans/)。
+
+## 控制面 API
+
+| 方法 | 路径 | 说明 |
 |---|---|---|
-| **思考透传**：ZCode 自动探测模型思考档位并带 thinking/output_config 参数，opencode.ai 返回 reasoning_content 思考流。网关是透明转发层、设计上不影响质量；但 **/models 必须一致转发**（否则 ZCode 思考档位探测变→才真影响质量）、thinking 参数不得剥离、reasoning_content 流不得破坏 | 设计结论已定，待真实接入测试闭环 | `docs/plans/opencode-go-router-ui-architecture-2026-08-22.md` §1.4；验收项 `docs/plans/opencode-go-router-implementation-plan-2026-08-22.md` §三.9 |
-| 出站 UA 被 Cloudflare 1010 拦（裸 urllib 403，带浏览器 UA 通过） | 已实测，实现时第一个验证点 | UI 架构 §1.3 |
-| 真实多 Key failover（V1）端到端 | 需 ≥2 把健康 Key 才能实证 | 主方案 §3.7 |
-| /usage 端点稳定性（V6） | 长期观察 | 主方案 §3.7 |
+| `GET` | `/api/status` | 汇总状态 + 同池告警 |
+| `GET` | `/api/keys` | Key 列表 + 同池告警 |
+| `POST` | `/api/keys` | 录入（`{key, label}`，实时校验） |
+| `PATCH` | `/api/keys/{id}` | 改名 / 停用 / 启用 |
+| `DELETE` | `/api/keys/{id}` | 删除 |
+| `POST` | `/api/keys/{id}/refresh` | 强制刷新用量 |
+| `POST` | `/api/keys/{id}/reactivate` | 手动复活冷却 Key |
+| `POST` | `/api/keys/{id}/quarantine` | 手动隔离 |
+| `GET` | `/api/sessions` | 会话绑定表 |
+| `GET` | `/api/events` | 事件日志 |
+| `POST` | `/api/events/clear` | 清空事件日志 |
+| `GET` / `PATCH` | `/api/config` | 读/改调度参数（见下） |
+
+`PATCH /api/config` 支持的字段与范围：
+
+| 字段 | 默认 | 范围 |
+|---|---|---|
+| `pollIntervalMs` | `900000`（15 分钟） | 5–60 分钟 |
+| `preSwitchPct` | `90` | 0–100（5h 窗口预切换阈值 %） |
+| `preSwitchWeeklyPct` | `95` | 0–100（周窗口预切换阈值 %） |
+| `concurrencyPerKey` | `5` | 1–8 |
+| `stickyEnabled` | `true` | bool（关掉后粘性按请求重新选 Key） |
+| `localToken` | `null` | 字符串 ≥4 字符；设空字符串清除 |
+
+## 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `GO_PORT` | `8788` | 监听端口（也可 `--port <N>` CLI 参数，优先级：`GO_PORT` > CLI > 默认） |
+| `MOCK_MODE`（或 `GO_MOCK_MODE`） | 关 | `1` 开启合成数据模式（不连上游，前端演示/开发） |
+| `GO_LOG` | 仅控制台 | 追加写入的日志文件路径 |
+| `GO_STATE_DIR` | 脚本所在目录 | 状态目录（`keys.json` 落在此处；演示时指向临时目录可保护真实 Key） |
+
+示例：
+
+```bash
+# MOCK 演示（不动真实 keys.json）
+MOCK_MODE=1 GO_STATE_DIR=/tmp/mockstate node go-gateway.cjs
+
+# 指定端口与日志
+GO_PORT=9000 GO_LOG=~/go.log node go-gateway.cjs
+```
+
+## 生命周期守护（可选，go-guard.cjs）
+
+`go-guard.cjs` 让网关跟随 ZCode 启停：ZCode 会话启动时（SessionStart 钩子）自动拉起网关，ZCode 退出满 60 秒自动停网关、释放 PID 锁（单例，PID 锁在 `~/.opencode-go-router/`）。在 `~/.zcode/cli/config.json` 的 `hooks` 块加一条 type=process 的 SessionStart 钩子指向 `go-guard.cjs` 即可（实现参照 `reference/dt-mcp-watch/` 的 v3 模式）。测试环境变量：`GO_GUARD_TEST_ZCODE=1|0`、`GO_GUARD_IDLE_S=5`。
+
+## 安全说明
+
+- **真实 Key 只存运行时**：`keys.json` 写入时 `chmod 0600` 且已 `.gitignore`，任何源码/文档不含真实密钥。
+- 网关默认只监听 `127.0.0.1`（本地回环），不暴露局域网。
+- 如需防同机其他进程借用，设置 `localToken`（见配置表）；注意设置后客户端 apiKey 也要改成同值。
 
 ## 目录结构
 
 ```text
 .
-├── README.md
-├── AGENTS.md
-├── PROJECT_STATUS.md
-├── .gitignore
+├── go-gateway.cjs               # 网关本体（转发 + 调度 + 状态机 + 控制面 API + 静态托管，零依赖）
+├── go-guard.cjs                 # 生命周期守护（可选，跟随 ZCode 启停）
+├── ui/                          # 仪表盘单页（index.html / app.js / style.css，纯原生）
+├── bug/                         # Bug 台账与回归脚本（key-switch-sim.cjs、go-guard-verify.sh）
 ├── docs/
-│   ├── plans/                       # 方案：主方案 + 外挂证据（决策源）
-│   └── reports/                     # 一次性报告：历史可行性调研
-├── reference/
-│   └── dt-mcp-watch/                # 生命周期守护参考实现（go-guard.cjs 母本）
-│       ├── dt-guard.cjs
-│       └── README.md                # 部署/复现/回退手册（含 v1/v2/v3 决策记录）
-├── go-gateway.cjs                   # 网关本体（转发/调度/状态机/控制面 API/静态前端）
-├── go-guard.cjs                     # 生命周期守护（跟随 ZCode 启停，母本 reference/dt-mcp-watch/dt-guard.cjs）
-├── ui/                              # 前端六视图（index.html / app.js / style.css，纯原生）
-├── keys.json                        # 运行态：Key/状态/会话绑定（0600，已 gitignore，不入库）
-└── project-context/                 # 归档：status-NNN-YYYYMMDD.md
+│   ├── plans/                   # 设计决策文档（主方案 / 实测证据 / UI 架构）
+│   └── reports/                 # 历史调研
+└── reference/dt-mcp-watch/      # 守护模式参考实现（v1/v2/v3 决策记录）
 ```
 
-### 网关代码现状（Phase 1 MVP 已实现）
+## 设计文档
 
-- `go-gateway.cjs`：网关本体（Node 24 原生 http/https，零依赖），含转发面 `/v1/chat/completions`（x-session-id 粘性 + 缓冲首字节 failover + SSE 透传 + 429 metadata 解析）、控制面 `/api/*`（keys/sessions/events/status/config）、状态机（active/cooldown_rolling/cooldown_weekly/quarantined/invalid）、/usage 轮询、MOCK_MODE、静态前端托管。
-- `ui/`：六视图本地单页（总览/Key 管理/隔离区/会话绑定/事件日志/设置），浅色玻璃质感主题（奶油白偏棕 + backdrop-filter 磨砂 + 琥珀/翠绿高饱和点缀 + 底部波浪流水 + 衬线标题）。
-- `keys.json`：Key、状态、冷却截止、隔离记录、会话绑定表（运行态，**真实 Key 不入库**，已入 `.gitignore`）。
-- `go-guard.cjs`：生命周期守护（**已实现**，照抄 `reference/dt-mcp-watch/dt-guard.cjs` 参数化：端口 8788、锁/日志在 `~/.opencode-go-router/`、`GO_GUARD_TEST_ZCODE`/`GO_GUARD_IDLE_S` 测试 env）；已挂 ZCode `~/.zcode/cli/config.json` 的 SessionStart 钩子（与现有 dt-guard 钩子并列，互不干扰）。
+- [主方案（架构/调度逻辑/分期）](docs/plans/opencode-go-key-router-2026-08-22.md)：问题定义、核心逻辑 L1–L8、架构与选型、开放项。
+- [实测证据链](docs/plans/opencode-go-router-evidence-2026-08-22.md)：`/usage`/429/401 实测、上游协议、ZCode 请求头实证（粘性键选择依据）。
+- [UI 架构（前端/后端规格）](docs/plans/opencode-go-router-ui-architecture-2026-08-22.md)：六视图数据流与 API 契约设计。
 
-## 运行
+## 免责声明
 
-```bash
-# 真实模式（需先在前端录入真实 Go Key，或启动后用 POST /api/keys）
-node go-gateway.cjs
+本项目是个人工具，仅做**本地配额管理**：不作任何上游请求代答、不破解/绕过上游限制，正常请求仍受 OpenCode Go 服务条款约束。请合法使用自己的订阅 Key。
 
-# MOCK_MODE（合成数据，不连真实端点，前端开发/演示用；可用 GO_STATE_DIR 指向临时目录保护真实 keys.json）
-MOCK_MODE=1 GO_STATE_DIR=/tmp/mockstate node go-gateway.cjs
-```
+## License
 
-启动后浏览器打开 `http://127.0.0.1:8788`。环境变量：`GO_PORT`（默认 8788）、`GO_LOG`（日志文件）、`GO_STATE_DIR`（状态目录）、`MOCK_MODE=1`；也支持 `--port <N>` CLI 参数（go-guard 用它精确定位进程）。
-
-**生命周期（跟随 ZCode 启停）**：ZCode 会话启动时 SessionStart 钩子自动拉起网关，ZCode 退出满 60s 自动停网关、释放锁。手动测试守护：`GO_GUARD_TEST_ZCODE=1|0 GO_GUARD_IDLE_S=5 node go-guard.cjs`；回归：`bash bug/regression/go-guard-verify.sh`。
-
-ZCode 对接（一次性）：`C:\Users\duanz\.zcode\v2\config.json` 的 OpencodeGo provider `ce6a858a` 把 `options.baseURL` 改为 `http://127.0.0.1:8788/v1`、`apiKey` 改占位符；另保留一个 disabled 的直连逃生门 provider。
-
-## 已知跨工作区引用（不随本项目迁移）
-
-- 可行性报告内链接 `claude-desktop-cc-switch-session-replay-diagnosis-2026-07-14.md`（count_tokens 降级诊断）指向 Me 工作区 `D:\develop\Trae\Me\docs\reports\`，本项目未迁移该报告，链接在本地不可点（仅作历史溯源）。
-
-## 归档命名规范（回溯入口）
-
-- 归档文件放 `project-context/`，命名 `status-<三位序号>-<YYYYMMDD>.md`，序号递增 = 时间递增 = 回溯顺序。例：`status-001-YYYYMMDD.md`。
-- 每个归档文件内部：**前面一段摘要 + 后面原 `PROJECT_STATUS` 内容原样保留**。
-- 要追历史：按序号升序读 `project-context/status-*.md`（先摘要后全文），读完即回溯整段日志；`PROJECT_STATUS.md` 底部「已压缩摘要」栈给出各段一句话结论。
-- 归档只有在用户显式要求（沉淀项目经验 / 压缩 / 归档）时创建。
-
-## Naming
-
-- 目录名使用稳定、可读的英文 slug。
-- 设计文档沿用「决策源」语义，只做复制与明显过时路径修正，不删减改写。
-- 真实 Key 只存在于运行时 `keys.json`，任何源码/文档/提交不得出现真实密钥（历史文档中仅有 `sk-wfj0...` 这类脱敏占位符）。
-
-## Evolution Rules
-
-- 设计方向 / 技术栈 / 结构变化时，更新本 README 结构摘要与 `PROJECT_STATUS.md`。
-- 网关代码实现、决策点确认、V1-V6 验证进展都记录到 `PROJECT_STATUS.md`（只写已发生事实，不写 TODO）。
-- 详细、快速变化的状态不进 README。
-
-## Run
-
-- 当前阶段无网关代码，无运行命令。网关实现后，运行方式见项目根部署 `README.md`（参照 `reference/dt-mcp-watch/README.md` 结构）与主方案 §3.3 ZCode 对接、§3.5 分阶段实施。
+[MIT](LICENSE)

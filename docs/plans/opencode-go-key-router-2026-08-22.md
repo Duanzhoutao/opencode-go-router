@@ -133,7 +133,7 @@ ZCode 启动 -> 首会话 -> SessionStart 钩子 -> go-guard.cjs
 
 | 环节 | 选型 | 理由 |
 |---|---|---|
-| 网关 | Node.js 24（`D:\APP\NodeJS`）+ 原生 http | 本机既有；流式透传原生支持；零新依赖 |
+| 网关 | Node.js ≥18（本机既有 24）+ 原生 http | 本机既有；流式透传原生支持；零新依赖 |
 | 桌面呈现 | 首期浏览器仪表盘 + 桌面快捷方式；后期可选 Electron 薄壳 | 核心价值在路由逻辑；Electron 是呈现层增强 |
 | 前端 | 原生单页（HTML/CSS/JS 或 Vue3 CDN） | 无构建链 |
 | 存储 | JSON 文件 0600 | 数据量小；SQLite 后期可换 |

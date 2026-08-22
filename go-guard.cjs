@@ -2,7 +2,7 @@
 /**
  * go-guard.cjs — OpenCode Go 本地网关(8788)的守护者（跟随 ZCode 启停）
  *
- * 由 ZCode 的 SessionStart 钩子调用（C:\Users\duanz\.zcode\cli\config.json 的 hooks 块，
+ * 由 ZCode 的 SessionStart 钩子调用（~/.zcode/cli/config.json 的 hooks 块，
  * type: process）。母本：reference/dt-mcp-watch/dt-guard.cjs（桌面 MCP 守护，v3 模式）。
  * 生命周期（与桌面 MCP 同构）：
  *   1. 只启动一次：第一个钩子实例抢到 PID 锁成为 owner；后续所有调用

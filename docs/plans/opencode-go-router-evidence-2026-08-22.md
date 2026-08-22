@@ -56,9 +56,9 @@ HTTP 429  Content-Type: text/plain;charset=UTF-8  Retry-After: 155754
 
 ## 2. ZCode 密钥机制实测（asar 反编译 + config + 日志，2026-08-22）
 
-- Key 存放：`C:\Users\duanz\.zcode\v2\config.json` 的 `provider.<id>.options.apiKey`（OpencodeGo provider `ce6a858a`，kind=openai-compatible，baseURL `https://opencode.ai/zen/go/v1`，模型 deepseek-v4-flash / deepseek-v4-flash-vision-exp / ox-alpha-free）。
+- Key 存放：`~/.zcode/v2/config.json` 的 `provider.<id>.options.apiKey`（OpencodeGo provider `ce6a858a`，kind=openai-compatible，baseURL `https://opencode.ai/zen/go/v1`，模型 deepseek-v4-flash / deepseek-v4-flash-vision-exp / ox-alpha-free）。
 - Key 解析：Vercel AI SDK `loadApiKey`（provider 构造时 apiKey -> 环境变量兜底），此后固化进 provider 实例。
-- asar（`C:\Program Files\ZCode\resources\app.asar`，294MB）反编译结论：
+- asar（ZCode 安装目录的 `resources/app.asar`，294MB）反编译结论：
   - `reloadConfig` / config watcher：**0 匹配**（无配置热重载）；
   - `{env:}` / `{file:}` 配置模板展开：**不存在**（匹配全是 JS 噪声：WASM env、PowerShell `${env:...}`、File 对象）；
   - `customCa`：memoize 库示例代码的误报；`allowInsecureHttp` 只用于火山 V4 请求签名；
@@ -69,7 +69,7 @@ HTTP 429  Content-Type: text/plain;charset=UTF-8  Retry-After: 155754
 
 ## 3. ZCode 请求头实证（model-io 日志，2026-08-22）
 
-日志：`C:\Users\duanz\.zcode\cli\rollout\model-io-sess_*.jsonl`（两个会话文件）。
+日志：`~/.zcode/cli/rollout/model-io-sess_*.jsonl`（两个会话文件）。
 
 | 信号 | 实测 | 路由含义 |
 |---|---|---|
@@ -80,7 +80,7 @@ HTTP 429  Content-Type: text/plain;charset=UTF-8  Retry-After: 155754
 
 ## 4. 生命周期模式实证（dt-guard，2026-08-22 当日日志）
 
-`C:\Users\duanz\.desktop-touch-mcp\dt-guard.log` 尾部（当日完整循环）：
+`~/.desktop-touch-mcp/dt-guard.log` 尾部（当日完整循环）：
 
 ```
 2026-08-22T04:32:01Z zcode gone 60s -> stop engine, release lock, exit
