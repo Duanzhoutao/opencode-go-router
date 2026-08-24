@@ -76,7 +76,7 @@ function defaultState() {
       concurrencyPerKey: 5,           // 每 Key 并发上限
       localToken: null,               // 可选本地 token：设置后转发面与控制面要求 Bearer
       stickyEnabled: true,            // x-session-id 粘性开关
-      retryEmptyResponse: true,       // 空回复重试优化：识别上游空流→掐断连接→触发 ZCode 网络级自动重试
+      retryEmptyResponse: false,      // 空回复重试优化：识别上游空流->掐断连接->触发 ZCode 网络级自动重试；默认关（缓冲整流让思考不实时滚动，2026-08-24 用户定稿）
       fallback: {                     // 备用通道（通用 OpenAI 协议上游，字段全部前端可配）
         enabled: false,
         label: "官方 DeepSeek",
@@ -255,51 +255,50 @@ const inflightDec = (id) => inflight.set(id, Math.max(0, (inflight.get(id) || 0)
 
 const quotaPercent = (k, w) => (k.quota && k.quota[w] ? k.quota[w].percent : 0);
 
-// ---------------- 反浪费（drain）调度：缓存核心（BUG-008） ----------------
-// 核心：网关唯一优化目标 = 提示词缓存命中率（切换对 ZCode 无感、代价为零）→ 会话粘性 = 缓存积累。
-// 月额度将尽（剩余 < 5h 窗口 ≈ monthly ≥80%，或临近续费日仍有剩余）的 key 注定死亡：
-// 其缓存无未来价值（会话迟早迁走、必刷新一次）→ 周额度无关紧要 → 最高优先用完丢弃。
-// 只有月额度健康的 key 才谈周平衡/防封。
-const DRAIN_MONTHLY_PCT = 80;    // monthly ≥80% ≈ 剩余 <5h 窗口（$12/$60）
-const DRAIN_RENEWAL_HOURS = 72;  // 距 monthly.resetsAt（=订阅续费日）≤72h 且仍有剩余
+// ---------------- 调度（L3）：双策略排序（2026-08-24 定稿） ----------------
+// 缓存核心不变：网关唯一优化目标 = 提示词缓存命中率 -> 粘性层健康绑定绝不迁移。
+// 会话流量（带 x-session-id，有粘性与缓存收益）= 到期优先（EDF）：
+//   monthly.resetsAt = 订阅续费日 = 额度到期日，到期未用完的额度随重置作废 ->
+//   永远先花马上作废的钱；无 resetsAt（一次性套餐）余额不作废，视作「存款」最后花。
+// 无会话流量（不带 x-session-id，本地脚本/训练模型调用等）= 最轻松优先：
+//   无缓存收益且常为突发批量 -> 路由到当前余量最大的 Key，避免集中打满一把 Key 触发 429 风暴。
+// 两策略只在 新会话绑定 / 绑定失效重分配 / failover 目标选择 时生效，互不越过粘性层。
 const REVIVE_EPSILON_MS = 5 * 60 * 1000; // 隔离复查过点缓冲：monthly.resetsAt 带快照截断毫秒，防时钟/服务端延迟误判
 
-function isDrainKey(k) {
+// 月到期时间戳；缺失/非法（一次性套餐等）= Infinity（最后消耗）
+function expiryTime(k) {
   const m = k.quota && k.quota.monthly;
-  if (!m) return false;
-  if (m.percent >= DRAIN_MONTHLY_PCT) return true;
-  if (m.percent > 0 && m.resetsAt) {
-    const hours = (new Date(m.resetsAt).getTime() - Date.now()) / 3600e3;
-    if (hours <= DRAIN_RENEWAL_HOURS) return true;
-  }
-  return false;
+  if (!m || !m.resetsAt) return Infinity;
+  const t = new Date(m.resetsAt).getTime();
+  return Number.isFinite(t) ? t : Infinity;
 }
 
-// 排序：drain 优先（到期近→剩余少），其余 balance（周剩余多→5h 剩余多→并发少）
+// 会话流量排序：月到期近者优先 -> 同到期先用月额度将尽者 -> 周剩余 -> 5h 剩余 -> 并发少
 function compareKeys(a, b) {
-  const da = isDrainKey(a) ? 0 : 1;
-  const db = isDrainKey(b) ? 0 : 1;
-  if (da !== db) return da - db;
-  if (da === 0) {
-    const ra = (a.quota.monthly && a.quota.monthly.resetsAt) || "";
-    const rb = (b.quota.monthly && b.quota.monthly.resetsAt) || "";
-    if (ra !== rb) return ra < rb ? -1 : 1;
-    return quotaPercent(b, "monthly") - quotaPercent(a, "monthly");
-  }
-  const dWeekly = quotaPercent(a, "weekly") - quotaPercent(b, "weekly");
-  const dRolling = quotaPercent(a, "rolling") - quotaPercent(b, "rolling");
-  const dInflight = (inflight.get(a.id) || 0) - (inflight.get(b.id) || 0);
-  return dWeekly || dRolling || dInflight;
+  const ta = expiryTime(a), tb = expiryTime(b);
+  if (ta !== tb) return ta - tb;
+  const dMonthly = quotaPercent(b, "monthly") - quotaPercent(a, "monthly");
+  if (dMonthly) return dMonthly;
+  return compareRelaxed(a, b);
 }
 
-// 新会话 / 迁移分配：drain（月额度将尽）优先用完丢弃，其余按「周剩余最多→5h 剩余→并发」平衡
-function pickBestKey(excludeId, skipIds) {
+// 无会话流量排序（「最轻松」= 余量最大）：5h 剩余 -> 周剩余 -> 月剩余 -> 并发少
+function compareRelaxed(a, b) {
+  const dRolling = quotaPercent(a, "rolling") - quotaPercent(b, "rolling");
+  const dWeekly = quotaPercent(a, "weekly") - quotaPercent(b, "weekly");
+  const dMonthly = quotaPercent(a, "monthly") - quotaPercent(b, "monthly");
+  const dInflight = (inflight.get(a.id) || 0) - (inflight.get(b.id) || 0);
+  return dRolling || dWeekly || dMonthly || dInflight;
+}
+
+// 新会话 / 迁移 / failover 目标分配：relaxed=true 走无会话策略，否则到期优先
+function pickBestKey(excludeId, skipIds, relaxed) {
   const cap = state.config.concurrencyPerKey;
   const actives = state.keys.filter((k) => k.status === "active" && k.id !== excludeId && !(skipIds && skipIds.has(k.id)));
   if (!actives.length) return null;
   const underCap = actives.filter((k) => (inflight.get(k.id) || 0) < cap);
   const pool = underCap.length ? underCap : actives;
-  pool.sort(compareKeys);
+  pool.sort(relaxed ? compareRelaxed : compareKeys);
   return pool[0];
 }
 
@@ -341,7 +340,8 @@ function getOrBindKey(sessionId) {
       return null;
     }
   }
-  const k = pickBestKey(null);
+  // 无会话（或关粘性）：无会话流量走最轻松优先（不粘不绑）；带会话但关粘性仍按到期优先逐请求选
+  const k = pickBestKey(null, null, !sessionId);
   if (k && sessionId) bindSession(sessionId, k);
   return k;
 }
@@ -351,6 +351,16 @@ function getOrBindKey(sessionId) {
 function markWindowLimited(key, w) {
   if (key.quota && key.quota[w]) key.quota[w].status = "rate-limited";
 }
+// 429 limitName 归一化（BUG-011）：实测 5h 窗口上游返回 "5 hour" 而非 "rolling"
+// （证据：2026-08-24 事件日志 `429 5 hour` 连打 11 次而 Key 未冷却--实时冷却此前从未生效过）。
+// 按关键词归一；认不出/缺失也按 rolling 兜底--GoUsageLimitError 必属三窗口之一，
+// 误判最坏 = 多冷却到下一次 /usage 轮询（≤15min）自愈，远好于不冷却引发 429 风暴。
+function normalizeLimitName(ln) {
+  const s = typeof ln === "string" ? ln.toLowerCase() : "";
+  if (s.includes("month")) return "monthly";
+  if (s.includes("week")) return "weekly";
+  return "rolling"; // "5 hour" / "rolling" / 未知值 / 缺失
+}
 function handleUpstreamError(key, status, bodyText) {
   let parsed = null;
   try { parsed = JSON.parse(bodyText); } catch {}
@@ -358,11 +368,12 @@ function handleUpstreamError(key, status, bodyText) {
   const meta = (parsed && (parsed.metadata || (parsed.error && parsed.error.metadata))) || {};
   if (status === 429 && parsed && parsed.error && parsed.error.type === "GoUsageLimitError") {
     if (meta.workspace && !key.workspaceId) key.workspaceId = meta.workspace;
-    const ln = meta.limitName;
+    const raw = typeof meta.limitName === "string" ? meta.limitName : "";
+    const ln = normalizeLimitName(raw);
     if (ln === "monthly") { quarantine(key, "monthly"); markWindowLimited(key, "monthly"); }
     else if (ln === "weekly") { cooldown(key, "cooldown_weekly", "weekly"); markWindowLimited(key, "weekly"); }
-    else if (ln === "rolling") { cooldown(key, "cooldown_rolling", "rolling"); markWindowLimited(key, "rolling"); }
-    addEvent("rate-limited", key.id, `429 ${ln || "?"}${meta.workspace ? " ws=" + meta.workspace : ""}`);
+    else { cooldown(key, "cooldown_rolling", "rolling"); markWindowLimited(key, "rolling"); }
+    addEvent("rate-limited", key.id, `429 ${ln}${raw && raw.toLowerCase() !== ln ? " (raw=" + raw + ")" : ""}${meta.workspace ? " ws=" + meta.workspace : ""}`);
     maybeWarnSamePool(key);
   } else if (status === 401) {
     quarantine(key, "auth_invalid");
@@ -486,7 +497,7 @@ function streamThrough(clientRes, upRes, key, sessionId, model, started, onUsage
     if (sse.length > 65536) sse = sse.slice(-16384);
   };
   const abnormalFinish = () => finishReason && !["stop", "tool_calls", "length", "content_filter"].includes(finishReason);
-  const enabled = () => state.config.retryEmptyResponse !== false;
+  const enabled = () => state.config.retryEmptyResponse === true;
   const emptySoFar = () => !sawContent && !sawToolCalls;
   upRes.on("data", (chunk) => {
     const text = chunk.toString("utf8");
@@ -526,7 +537,8 @@ function streamThrough(clientRes, upRes, key, sessionId, model, started, onUsage
 
 // 首字节前失败后的统一兜底（BUG-002/005/006）：
 //   1) 瞬时错误（5xx/网络/超时）先在原 key 上重试 SAME_KEY_RETRIES 次（限额/401 不重试）；
-//   2) 有界 failover：每把 key 至多试一次、总上限 MAX_FAILOVER（防死循环）；
+//   2) 有界 failover：每把 key 至多试一次、总上限 MAX_FAILOVER（防死循环）；目标与原请求同策略
+//      （有会话=到期优先，无会话=最轻松优先）；
 //   3) failover 成功当场把会话重绑到 fallback key（下个请求直连，避免晚一拍 + 计数归零）；
 //   4) 全部耗尽如实回最后错误（附最近恢复时间）。
 async function failoverChain(res, key, out, rawBody, clientHeaders, sessionId, model, started) {
@@ -550,7 +562,7 @@ async function failoverChain(res, key, out, rawBody, clientHeaders, sessionId, m
   const tried = new Set([key.id]);
   let fallback = null;
   let attempts = 0;
-  while (attempts < MAX_FAILOVER && (fallback = pickBestKey(key.id, tried))) {
+  while (attempts < MAX_FAILOVER && (fallback = pickBestKey(key.id, tried, !sessionId))) {
     attempts++;
     tried.add(fallback.id);
     inflightInc(fallback.id);
@@ -985,13 +997,13 @@ async function handleFallbackTest(req, res) {
 }
 
 // ---------------- MOCK_MODE 合成剧本 ----------------
-function mockUsage(rollingPct, weeklyPct, monthlyPct, rollingStatus, weeklyStatus, monthlyStatus) {
+function mockUsage(rollingPct, weeklyPct, monthlyPct, rollingStatus, weeklyStatus, monthlyStatus, monthlyDays) {
   const now = Date.now();
   const iso = (ms) => new Date(now + ms).toISOString();
   return {
     rolling: { status: rollingStatus || "ok", percent: rollingPct, resetsAt: iso(5 * 3600e3) },
     weekly: { status: weeklyStatus || "ok", percent: weeklyPct, resetsAt: iso(3 * 24 * 3600e3) },
-    monthly: { status: monthlyStatus || "ok", percent: monthlyPct, resetsAt: iso(28 * 24 * 3600e3) },
+    monthly: { status: monthlyStatus || "ok", percent: monthlyPct, resetsAt: iso((monthlyDays || 28) * 24 * 3600e3) },
   };
 }
 
@@ -1003,12 +1015,14 @@ function ensureMockData() {
     quota: u, quarantinedAt: status === "quarantined" ? new Date().toISOString() : null,
     quarantineReason: reason || null, stats: stats || { requests: 0, cachedTokens: 0, cacheHits: 0 },
   });
+  // 月窗到期错开演示双策略：主力 9 天后到期（最近）-> 会话流量到期优先选它；
+  // 备用 5h 余量最大 -> 无会话流量最轻松优先选它
   state.keys.push(
-    mk("主力", "active", "wrk_AAA111", mockUsage(35, 40, 50), null, { requests: 86, cachedTokens: 4100, cacheHits: 9 }),
-    mk("备用", "active", "wrk_BBB222", mockUsage(12, 8, 22), null, { requests: 34, cachedTokens: 900, cacheHits: 4 }),
-    mk("周限冷却", "cooldown_weekly", "wrk_CCC333", mockUsage(0, 100, 55, "ok", "rate-limited"), null, { requests: 120, cachedTokens: 0, cacheHits: 0 }),
-    mk("5h 冷却", "cooldown_rolling", "wrk_DDD444", mockUsage(100, 70, 60, "rate-limited"), null, { requests: 15, cachedTokens: 0, cacheHits: 0 }),
-    mk("月限隔离", "quarantined", "wrk_EEE555", mockUsage(0, 0, 100, "ok", "ok", "rate-limited"), "monthly", { requests: 200, cachedTokens: 0, cacheHits: 0 }),
+    mk("主力", "active", "wrk_AAA111", mockUsage(35, 40, 50, null, null, null, 9), null, { requests: 86, cachedTokens: 4100, cacheHits: 9 }),
+    mk("备用", "active", "wrk_BBB222", mockUsage(12, 8, 22, null, null, null, 26), null, { requests: 34, cachedTokens: 900, cacheHits: 4 }),
+    mk("周限冷却", "cooldown_weekly", "wrk_CCC333", mockUsage(0, 100, 55, "ok", "rate-limited", null, 15), null, { requests: 120, cachedTokens: 0, cacheHits: 0 }),
+    mk("5h 冷却", "cooldown_rolling", "wrk_DDD444", mockUsage(100, 70, 60, "rate-limited", null, null, 21), null, { requests: 15, cachedTokens: 0, cacheHits: 0 }),
+    mk("月限隔离", "quarantined", "wrk_EEE555", mockUsage(0, 0, 100, "ok", "ok", "rate-limited", 28), "monthly", { requests: 200, cachedTokens: 0, cacheHits: 0 }),
     mk("失效", "invalid", null, mockUsage(0, 0, 0), "auth_invalid", { requests: 0, cachedTokens: 0, cacheHits: 0 })
   );
   state.sessions.push(
@@ -1318,10 +1332,8 @@ function mockChat(req, res) {
     let payload = {};
     try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
     const model = payload.model || "mock-model";
-    const sessionId = req.headers["x-session-id"] || "mock-anon";
-    let key = state.keys.find((k) => k.status === "active");
-    const sess = state.sessions.find((s) => s.sessionId === sessionId);
-    if (sess) { const b = state.keys.find((k) => k.id === sess.keyId && k.status === "active"); if (b) key = b; }
+    const sessionId = req.headers["x-session-id"] || null;
+    const key = getOrBindKey(sessionId); // 与真实路径同调度：粘性 + 会话到期优先 / 无会话轻松优先
     if (!key) {
       // 兜底（MOCK 演示）：无可用 key 且备用通道就绪 → 合成备用 SSE 流（真实路径见 tryFallback）
       if (fallbackReady() && noUsableKey()) {
@@ -1345,8 +1357,7 @@ function mockChat(req, res) {
       }
       return jsonError(res, 429, { error: { type: "GoUsageLimitError", message: "mock: no active key", metadata: {} } });
     }
-    if (state.fallbackState.sessionStart) markFallbackEnd("go-recovered"); // 备用中恢复 → 切回 Go
-    bindSession(sessionId, key);
+    if (state.fallbackState.sessionStart) markFallbackEnd("go-recovered"); // 备用中恢复 -> 切回 Go
     key.stats.requests += 1;
     key.stats.totalTokens = (key.stats.totalTokens || 0) + 15; // mock 流末 usage 块等值
     saveState();
@@ -1414,6 +1425,52 @@ async function runPoll() {
   schedulePoll();
 }
 
+// ---------------- 冷却到期看护（L5 增强）：窗口 resetsAt 过点即时定向复查回池 ----------------
+// 冷却 Key 的恢复不等 15min 轮询：quota 已标明窗口重置点（resetsAt），过点即定向重查 /usage，
+// 以服务器真相驱动激活（不做本地免查放行--防本地时钟偏差/边界未真过时误放行引发 429 循环；
+// 查了仍限则采纳新的 resetsAt 继续按新边界等，自愈）。不存任何计时器字段：每 tick 从当前
+// keys 状态推导到点集合 -> 网关断开/重启期间过点的 Key 在启动后首个看护周期即被补查；
+// fetchUsage 失败保持冷却、下个 tick 自然重试（保守不错放）。月限隔离不在此列（沿用 resetsAt+ε 复活门禁）。
+const COOLDOWN_WATCH_MS = 30 * 1000;         // 看护节拍
+const COOLDOWN_WATCH_EPSILON_MS = 30 * 1000; // 过点缓冲：防本地时钟略快提前查（查了也只是仍限，自愈）
+const cooldownWatchBusy = new Set();         // 同 Key 防并发复查
+let cooldownWatchTimer = null;
+
+function cooldownWatchWindow(key) {
+  return key.status === "cooldown_weekly" ? (key.quota && key.quota.weekly) : (key.quota && key.quota.rolling);
+}
+
+async function runCooldownWatch() {
+  const now = Date.now();
+  for (const key of state.keys) {
+    if (key.status !== "cooldown_rolling" && key.status !== "cooldown_weekly") continue;
+    if (cooldownWatchBusy.has(key.id)) continue;
+    const w = cooldownWatchWindow(key);
+    if (!w || !w.resetsAt) continue; // 无 resetsAt（旧快照/一次性）：交给 15min 轮询兜底
+    const t = new Date(w.resetsAt).getTime();
+    if (!Number.isFinite(t) || now < t + COOLDOWN_WATCH_EPSILON_MS) continue;
+    cooldownWatchBusy.add(key.id);
+    try {
+      const v = await fetchUsage(key.key);
+      if (v.ok) {
+        key.quota = toQuota(v.usage);
+        runStateMachine(key); // 已重置 -> activate（recover 事件）；仍限 -> 新 resetsAt 继续等
+        saveState();
+      } // 查询失败：保持冷却，下个 tick 重试
+    } finally {
+      cooldownWatchBusy.delete(key.id);
+    }
+  }
+}
+
+function scheduleCooldownWatch(delayMs) {
+  if (cooldownWatchTimer) clearTimeout(cooldownWatchTimer);
+  cooldownWatchTimer = setTimeout(async () => {
+    try { await runCooldownWatch(); } catch (e) { log("cooldown watch error: " + e.message); }
+    scheduleCooldownWatch();
+  }, delayMs != null ? delayMs : COOLDOWN_WATCH_MS);
+}
+
 // ---------------- 启动 ----------------
 loadState();
 ensureMockData();
@@ -1440,7 +1497,7 @@ if (process.env.GO_NO_LISTEN === "1") {
   server.on("error", (e) => { if (e.code === "EADDRINUSE") log("FATAL: port " + PORT + " already in use"); else log("server error: " + e.message); process.exit(1); });
   server.listen(PORT, "127.0.0.1", () => {
     log(`OpenCode Go gateway v${VERSION} listening on http://127.0.0.1:${PORT} (mode=${MOCK ? "mock" : "real"})`);
-    if (!MOCK) schedulePoll();
+    if (!MOCK) { schedulePoll(); scheduleCooldownWatch(5 * 1000); } // 看护首轮 5s：重启后尽快补查断开期间过点的冷却 Key
   });
 
   for (const sig of ["SIGINT", "SIGTERM"]) {

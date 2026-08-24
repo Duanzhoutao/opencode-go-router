@@ -28,7 +28,7 @@ GO_PORT=9000 GO_LOG=~/go.log node go-gateway.cjs
 | `pollIntervalMs` | `900000`（15 分钟） | 5–60 分钟 | `/usage` 三窗口用量轮询间隔 |
 | `concurrencyPerKey` | `5` | 1–8 | 每 Key 并发上限；满载时调度放宽（不拒绝请求） |
 | `stickyEnabled` | `true` | bool | 会话粘性开关；关闭后每个请求重新调度（缓存收益丢失） |
-| `retryEmptyResponse` | `true` | bool | 空回复重试优化（见 architecture.md）；关闭后完全透明直通 |
+| `retryEmptyResponse` | `false` | bool | 空回复重试优化（见 architecture.md）；默认完全透明直通，需要时打开 |
 | `localToken` | `null` | 字符串 ≥4 字符 | 本地鉴权：设置后转发面与控制面都要求 `Bearer` 头（`/health` 除外）；设空字符串清除。注意客户端 apiKey 需同步改 |
 
 ## 备用通道配置（备用通道视图 / `PATCH /api/fallback`）

@@ -467,7 +467,7 @@ function renderSettings() {
     $("#cfgPoll").value = Math.round((c.pollIntervalMs || 900000) / 60000);
     $("#cfgConc").value = c.concurrencyPerKey ?? 5;
     $("#cfgSticky").checked = c.stickyEnabled !== false;
-    $("#cfgRetryEmpty").checked = c.retryEmptyResponse !== false;
+    $("#cfgRetryEmpty").checked = c.retryEmptyResponse === true;
     $("#cfgToken").value = "";
   }
   $("#cfgToken").placeholder = c.localToken === "(set)" ? "已设置（输入新值替换，留空即清除）" : "未设置（≥4 字符）";

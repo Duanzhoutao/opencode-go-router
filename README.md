@@ -18,10 +18,10 @@ OpenCode Go 订阅的每个 Key 有 **5 小时滚动 / 每周 / 每月** 三重�
 ## 特性
 
 - **会话粘性（`x-session-id`）**：同一会话永远走同一 Key，模型上下文缓存不因轮换失效；跨会话自动分配到不同 Key。
-- **限额感知调度**：每 15 分钟轮询 `/usage` 三窗口用量（5h 滚动 / 周 / 月，含 `resetsAt`）；月额度将尽的 Key 进入 drain（优先用完丢弃），其余按周余量平衡分配。
-- **透明 failover**：上游 429/5xx 时缓冲首字节后自动换下一个可用 Key（failoverChain 兜底），对客户端无感知。
+- **限额感知调度**：每 15 分钟轮询 `/usage` 三窗口用量（5h 滚动 / 周 / 月，含 `resetsAt`）；会话流量按**月到期优先**（月窗到期未用完的额度随续费作废，先花马上到期的），无会话流量按**最轻松优先**（路由到余量最大的 Key）。
+- **透明 failover**：上游 429 实时冷却对应窗口（`limitName` 按关键词归一，5h 窗口上游实际叫 "5 hour"）后缓冲首字节自动换下一个可用 Key（failoverChain 兜底），对客户端无感知。
 - **备用通道（通用 OpenAI 协议兜底）**：全部 Go Key 不可用时自动切到任意 OpenAI 兼容上游（默认 DeepSeek 官方，火山方舟等均可），请求模型自动改写、思考强度默认拉满（`reasoning_effort=max`，各厂取值不同，可改或留空交上游默认）；任一 Go Key 恢复立刻切回。DeepSeek 官方可选**余额差值自动计费**（人民币快照差值 + 15 分钟采样 + 关网关补结算），其他端点不计费模式。
-- **空回复重试优化（`retryEmptyResponse`，默认开）**：上游长思考后偶发零正文空流，客户端会判 `empty_model_response` 且不重试；网关在首个正文字节前缓冲整条流，空回复则零字节掐断连接，触发客户端网络级自动重试。可在设置页关闭。
+- **空回复重试优化（`retryEmptyResponse`，默认关）**：上游长思考后偶发零正文空流，客户端会判 `empty_model_response` 且不重试；打开后网关在首个正文字节前缓冲整条流，空回复则零字节掐断连接，触发客户端网络级自动重试（代价：思考不实时滚动）。默认关，需要时设置页打开。
 - **同池检测**：从 429 响应 metadata 提取 workspace id，同 workspace 的 Key 标记「同池」并告警——提示轮换它们无效。
 - **状态机管理**：`active / cooldown_rolling / cooldown_weekly / quarantined / invalid` 五态 + 冷却截止时间；月限 Key 按重置时钟自动复查回池；支持手动停用、删除、复活、隔离。
 - **浏览器仪表盘**：七视图单页（总览 / Key 管理 / 隔离区 / 会话绑定 / 备用通道 / 事件日志 / 设置），用量条三档分色（绿 <90% / 金 ≥90% / 红 ≥100%），事件类型悬停有中文解释。
@@ -132,10 +132,12 @@ ZCode 配置示例：
   |---------------------------> quarantined（月限隔离，月窗重置自动复活）
   |-- 401/退订 --------------------> invalid（无效，需手动删除）
 
-全部不可用 --> 备用通道兜底（启用且配置就绪时）；任一 Key 恢复 --> 自动切回
+全部不可用 ——> 备用通道兜底（启用且配置就绪时）；任一 Key 恢复 ——> 自动切回
 ```
 
-选 Key 优先级：会话已绑定的 Key（粘性）> drain（月额度将尽，优先用完丢弃）> 周余量最多 > 并发最少；429 时 failover 链兜底。机制与决策见 [docs/architecture.md](docs/architecture.md)。
+冷却到窗口 `resetsAt` 过点后由 30 秒看护定向重查即时回池（不等 15 分钟轮询；网关重启后自动补查断开期间过点的 Key）；月限隔离按月窗重置时钟复查回池。
+
+选 Key 优先级：会话已绑定的 Key（粘性）> 会话流量按**月到期优先**（`resetsAt` 近者先，无到期日排最后）/ 无会话流量按**最轻松优先**（5h 余量最大）；429 实时冷却 + failover 链兜底。机制与决策见 [docs/architecture.md](docs/architecture.md)。
 
 ## 控制面 API
 
@@ -167,7 +169,7 @@ ZCode 配置示例：
 | `pollIntervalMs` | `900000`（15 分钟） | 5–60 分钟 |
 | `concurrencyPerKey` | `5` | 1–8 |
 | `stickyEnabled` | `true` | bool（关掉后粘性按请求重新选 Key） |
-| `retryEmptyResponse` | `true` | bool（空回复重试优化，默认开；关闭后完全透明直通） |
+| `retryEmptyResponse` | `false` | bool（空回复重试优化，默认关=完全透明直通；需要时打开） |
 | `localToken` | `null` | 字符串 ≥4 字符；设空字符串清除 |
 
 完整 API 说明与示例见 [docs/api.md](docs/api.md)，全部配置（含备用通道八字段）见 [docs/configuration.md](docs/configuration.md)。
