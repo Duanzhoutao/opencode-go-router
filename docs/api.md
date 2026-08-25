@@ -26,6 +26,7 @@
 | `GET` | `/api/fallback` | 备用通道视图（配置 + 余额 + 花费窗口聚合 + 结算记录） |
 | `GET` | `/api/relays` | 中转站列表（apiKey 掩码；含 inUse/连败/统计，按优先级升序） |
 | `GET` | `/api/models` | Go 模型列表缓存（半填半选候选源；启动 + 每轮询刷新） |
+| `GET` | `/api/stream` | **SSE 实时事件流**（`text/event-stream`）：`{"kind":"event","ev":{...}}` 结构性事件即 addEvent 同源；`{"kind":"activity","keyId"/"relayId"}` 流量信号（每请求、不入事件日志）。25s 心跳注释帧 `: ping`；连接上限 8；设 `localToken` 时经 `?token=` 查询参数鉴权（EventSource 无法带 Authorization header） |
 | `GET` | `/api/guide` | Agent 对接指引委派提示词（运行时生成，含本机安装目录/端口） |
 
 ### Key 管理

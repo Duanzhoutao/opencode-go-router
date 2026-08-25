@@ -139,9 +139,54 @@ function saveState() {
   } catch (e) { log("state save failed: " + e.message); }
 }
 
+// ---------------- 事件总线（SSE 推送源，2026-08-25 事件驱动改造） ----------------
+// addEvent 已是事实上的领域事件总线（40+ 调用点覆盖全部结构性状态变化），本总线把
+// 事件从「只写 state.events 等前端拉」升级为「实时推送给订阅者」；另设 activity 流量信号
+// （每请求发生、不入 state.events，防事件日志被流量刷屏挤掉结构性事件）。
+const busListeners = new Set();
+const BUS_MAX_LISTENERS = 8; // SSE 长连接上限（单用户本机场景）
+function busPublish(msg) {
+  for (const fn of busListeners) { try { fn(msg); } catch {} }
+}
+
 function addEvent(type, keyId, detail) {
-  state.events.unshift({ ts: new Date().toISOString(), type, keyId, detail });
+  const ev = { ts: new Date().toISOString(), type, keyId, detail };
+  state.events.unshift(ev);
   if (state.events.length > 500) state.events.length = 500;
+  busPublish({ kind: "event", ev });
+}
+
+// 流量信号：{ keyId | relayId } 二选一。用于前端即时点亮「使用中」光效。
+function notifyActivity(target) {
+  busPublish({ kind: "activity", keyId: target.keyId || null, relayId: target.relayId || null, ts: Date.now() });
+}
+
+// ---------------- SSE 事件流端点（2026-08-25 事件驱动改造） ----------------
+// 前端实时通道：addEvent 与 notifyActivity 经 busPublish 推送。localToken 校验走 ?token=
+// 查询参数（EventSource 无法带 Authorization header，本机 127.0.0.1 监听场景可接受，api.md 注明）。
+const SSE_HEARTBEAT_MS = 25 * 1000; // 心跳注释帧：防连接僵死占 listener 名额
+function handleStream(req, res, url) {
+  if (state.config.localToken && url.searchParams.get("token") !== state.config.localToken) {
+    return jsonError(res, 401, "invalid local token");
+  }
+  if (busListeners.size >= BUS_MAX_LISTENERS) {
+    return jsonError(res, 503, "too many stream connections");
+  }
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-store",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no",
+  });
+  res.write(": connected\n\n");
+  res.on("error", () => {}); // 客户端断开后 write 可能抛错，吞掉并靠 close 清理
+  const listener = (msg) => { try { res.write(`data: ${JSON.stringify(msg)}\n\n`); } catch {} };
+  busListeners.add(listener);
+  const hb = setInterval(() => { try { res.write(": ping\n\n"); } catch {} }, SSE_HEARTBEAT_MS);
+  res.on("close", () => {
+    clearInterval(hb);
+    busListeners.delete(listener);
+  });
 }
 
 function redactKey(k) {
@@ -383,12 +428,46 @@ function handleUpstreamError(key, status, bodyText) {
     else { cooldown(key, "cooldown_rolling", "rolling"); markWindowLimited(key, "rolling"); }
     addEvent("rate-limited", key.id, `429 ${ln}${raw && raw.toLowerCase() !== ln ? " (raw=" + raw + ")" : ""}${meta.workspace ? " ws=" + meta.workspace : ""}`);
     maybeWarnSamePool(key);
+    scheduleKeyProbe(key, 10 * 1000, "429"); // 定向补查 /usage：补真 resetsAt/percent，升级冷却看护精度
   } else if (status === 401) {
     quarantine(key, "auth_invalid");
     addEvent("quarantine", key.id, "401 during request");
   } else if (status >= 500) {
     addEvent("upstream-5xx", key.id, `HTTP ${status}`);
+    scheduleKeyProbe(key, 30 * 1000, "upstream-5xx");
   }
+}
+
+// ---------------- 失败定向复查（2026-08-25 事件驱动改造） ----------------
+// 失败后不等 15min 轮询，定向重查 /usage：429 补真 resetsAt（metadata 缺 resetsAt 时冷却看护
+// 只能交 15min 轮询兜底，复查后升级为精确到点）；5xx 核实 quota 真相。同 key 60s 节流 +
+// in-flight 去重防失败风暴。状态迁移由 runStateMachine 自然产生 recover/cooldown 事件 -> 经总线推前端。
+const PROBE_MIN_GAP_MS = 60 * 1000;
+const probeState = new Map(); // keyId -> { inFlight, lastAt }
+function scheduleKeyProbe(key, delayMs, reason) {
+  if (!key || key.status === "invalid") return;
+  const now = Date.now();
+  const ps = probeState.get(key.id);
+  if (ps && ps.inFlight) return;
+  if (ps && now - ps.lastAt < PROBE_MIN_GAP_MS) return;
+  probeState.set(key.id, { inFlight: true, lastAt: now });
+  setTimeout(async () => {
+    try {
+      const v = await fetchUsage(key.key);
+      if (v.ok) {
+        key.quota = toQuota(v.usage);
+        runStateMachine(key);
+        saveState();
+      } else if (v.code === 401) {
+        quarantine(key, "auth_invalid");
+        saveState();
+      }
+    } catch (e) { log("probe error: " + e.message); }
+    finally {
+      const st = probeState.get(key.id);
+      if (st) { st.inFlight = false; st.lastAt = Date.now(); }
+    }
+  }, Math.max(0, delayMs || 0));
 }
 
 // 同 workspace 共享额度告警（P9）：429 暴露的 workspace 若与别的 Key 相同则提示
@@ -438,6 +517,7 @@ function finishRequest(key, sessionId, model, started, cacheTokens) {
   }
   inflightDec(key.id);
   saveState();
+  notifyActivity({ keyId: key.id });
   if (cacheTokens > 0) addEvent("cache-hit", key.id, `${model} cached=${cacheTokens}`);
 }
 
@@ -927,6 +1007,7 @@ async function tryRelayPriority(res, upBody, clientHeaders, sessionId, model, st
       const pseudo = { id: relay.id, label: relay.label, stats: relay.stats };
       streamThrough(res, out.res, pseudo, sessionId, model, started, relayUsageRecorder(relay)); // finishRequest 负责 inflightDec
       saveState();
+      notifyActivity({ relayId: relay.id });
       return { handled: true };
     }
     inflightDec(relay.id);
@@ -1405,6 +1486,9 @@ const server = http.createServer((req, res) => {
     return forwardModels(res);
   }
 
+  // SSE 事件流（鉴权自带，须在控制面鉴权段之前：EventSource 走 ?token= 无 Authorization header）
+  if (req.method === "GET" && p === "/api/stream") return handleStream(req, res, url);
+
   // 控制面鉴权（/health 除外）
   const isApi = p.startsWith("/api/");
   if (isApi && state.config.localToken && req.headers.authorization !== "Bearer " + state.config.localToken) {
@@ -1701,6 +1785,7 @@ function mockChat(req, res) {
       r.failStreak = 0; r.lastReqAt = new Date().toISOString();
       r.stats.requests += 1; r.stats.totalTokens = (r.stats.totalTokens || 0) + 15;
       saveState();
+      notifyActivity({ relayId: r.id });
       res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store" });
       const rid = "mock-relay-" + Date.now();
       res.write(`data: ${JSON.stringify({ id: rid, object: "chat.completion.chunk", model: r.model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
@@ -1723,6 +1808,7 @@ function mockChat(req, res) {
         addEvent("fallback", null, `Go 无可用 key → ${f.label || "fallback"} ${f.model}（mock）`);
         state.fallbackState.costs.unshift({ ts: new Date().toISOString(), model: f.model, promptTokens: 120, completionTokens: 8, cacheHit: 0, cacheMiss: 120, reasoningTokens: 8 });
         saveState();
+        notifyActivity({ keyId: null, relayId: null }); // 备用通道流量：无对应卡，仅触发前端防抖刷新
         res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store" });
         const fid = "mock-fb-" + Date.now();
         res.write(`data: ${JSON.stringify({ id: fid, object: "chat.completion.chunk", model: f.model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
@@ -1741,6 +1827,7 @@ function mockChat(req, res) {
     key.stats.requests += 1;
     key.stats.totalTokens = (key.stats.totalTokens || 0) + 15; // mock 流末 usage 块等值
     saveState();
+    notifyActivity({ keyId: key.id });
     res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store" });
     const id = "mock-" + Date.now();
     res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
@@ -1812,7 +1899,8 @@ async function runPoll() {
 // 查了仍限则采纳新的 resetsAt 继续按新边界等，自愈）。不存任何计时器字段：每 tick 从当前
 // keys 状态推导到点集合 -> 网关断开/重启期间过点的 Key 在启动后首个看护周期即被补查；
 // fetchUsage 失败保持冷却、下个 tick 自然重试（保守不错放）。月限隔离不在此列（沿用 resetsAt+ε 复活门禁）。
-const COOLDOWN_WATCH_MS = 30 * 1000;         // 看护节拍
+const COOLDOWN_WATCH_MIN_MS = 1000;        // 看护节拍下限（防忙循环）
+const COOLDOWN_WATCH_CAP_MS = 60 * 1000;   // 看护节拍上限（无冷却 key / 无 resetsAt 时的兜底节拍）
 const COOLDOWN_WATCH_EPSILON_MS = 30 * 1000; // 过点缓冲：防本地时钟略快提前查（查了也只是仍限，自愈）
 const cooldownWatchBusy = new Set();         // 同 Key 防并发复查
 let cooldownWatchTimer = null;
@@ -1844,12 +1932,30 @@ async function runCooldownWatch() {
   }
 }
 
+// deadline 化（2026-08-25）：从当前冷却 key 推导最早过点时间（resetsAt + ε）精确到点重排，
+// 到点零延迟；上限封顶保证新进冷却的 key 最迟 60s 内被纳入并精确化（429 后 scheduleKeyProbe
+// 已定向查过一次，此处只管后续到点复查）；无冷却 key / 无 resetsAt 按上限兜底节拍。
+function cooldownWatchNextDelay() {
+  let earliest = Infinity;
+  const now = Date.now();
+  for (const key of state.keys) {
+    if (key.status !== "cooldown_rolling" && key.status !== "cooldown_weekly") continue;
+    if (cooldownWatchBusy.has(key.id)) continue;
+    const w = cooldownWatchWindow(key);
+    if (!w || !w.resetsAt) continue;
+    const t = new Date(w.resetsAt).getTime();
+    if (Number.isFinite(t)) earliest = Math.min(earliest, t + COOLDOWN_WATCH_EPSILON_MS);
+  }
+  if (!Number.isFinite(earliest)) return COOLDOWN_WATCH_CAP_MS;
+  return Math.min(COOLDOWN_WATCH_CAP_MS, Math.max(COOLDOWN_WATCH_MIN_MS, earliest - now));
+}
+
 function scheduleCooldownWatch(delayMs) {
   if (cooldownWatchTimer) clearTimeout(cooldownWatchTimer);
   cooldownWatchTimer = setTimeout(async () => {
     try { await runCooldownWatch(); } catch (e) { log("cooldown watch error: " + e.message); }
     scheduleCooldownWatch();
-  }, delayMs != null ? delayMs : COOLDOWN_WATCH_MS);
+  }, delayMs != null ? delayMs : cooldownWatchNextDelay());
 }
 
 // ---------------- 启动 ----------------
@@ -1875,6 +1981,7 @@ if (process.env.GO_NO_LISTEN === "1") {
     matchRelays, classifyRelayError, buildRelayBody, setRelayPriority, isolateRelay, activateRelay,
     goModelsHas, redactRelay, relayConfig, relayEnabled, relayUpstream, relayProbeModels,
     DEFAULT_DOWNGRADE_MODEL, RELAY_FAIL_STREAK_LIMIT, RELAY_QUOTA_RE, INUSE_WINDOW_MS,
+    busPublish, notifyActivity, scheduleKeyProbe, cooldownWatchNextDelay, probeState,
     config: state.config, state,
   };
 } else {

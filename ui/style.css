@@ -108,6 +108,11 @@ body {
   background: var(--glass-strong); border: 1px solid var(--glass-edge); color: var(--ink-soft);
   backdrop-filter: blur(8px);
 }
+/* 实时推送指示（SSE）：on 亮绿点 + 呼吸；未连接灰点 */
+.stream-ind { display: inline-flex; align-items: center; gap: 5px; }
+.stream-ind .sdot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); transition: background .3s; }
+.stream-ind.on .sdot { background: var(--ok); box-shadow: 0 0 8px rgba(45,154,95,0.7); animation: sdotPulse 2s ease-in-out infinite; }
+@keyframes sdotPulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
 .autorefresh { display: flex; align-items: center; gap: 6px; color: var(--ink-soft); font-size: 12.5px; }
 select, input {
   font-family: var(--sans);

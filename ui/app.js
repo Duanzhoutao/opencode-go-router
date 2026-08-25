@@ -896,6 +896,57 @@ function setupPolling() {
   if ($("#autoRefresh").checked && iv > 0) pollTimer = setInterval(() => refreshAll(true), iv);
 }
 
+// ---------- 实时推送（SSE，2026-08-25 事件驱动改造） ----------
+// 网关 /api/stream 推送两类消息：
+//   activity -> 即时点亮对应卡「使用中」光效（零往返，不等拉取周期）；
+//   event    -> 即时插入事件日志 + 750ms 防抖 refreshAll（事件伴随状态变化，统一防抖比维护类型矩阵简单）。
+// 拉取轮询保留为兜底对账；EventSource 断线原生自动重连。
+const GLOW_DECAY_MS = 10 * 60 * 1000; // 与服务端 INUSE_WINDOW_MS 对齐；refreshAll 时以服务端 inUse 重新对齐
+let streamOk = false;
+let refreshDebTimer = null;
+const glowTimers = new Map(); // 卡 id（Key/中转站共用）-> 本地衰减 timer
+
+function refreshDebounced() {
+  clearTimeout(refreshDebTimer);
+  refreshDebTimer = setTimeout(() => refreshAll(true), 750);
+}
+
+function markInUse(id) {
+  const el = document.querySelector(`[data-id="${CSS.escape(id)}"]`);
+  if (el) el.classList.add("in-use");
+  clearTimeout(glowTimers.get(id));
+  glowTimers.set(id, setTimeout(() => {
+    const card = document.querySelector(`[data-id="${CSS.escape(id)}"]`);
+    if (card) card.classList.remove("in-use");
+  }, GLOW_DECAY_MS));
+}
+
+function setupStream() {
+  const ind = $("#streamInd");
+  let es = null;
+  try {
+    es = new EventSource("/api/stream");
+  } catch (e) { if (ind) ind.title = "浏览器不支持实时推送，仅靠拉取刷新"; return; }
+  es.onopen = () => { streamOk = true; if (ind) ind.classList.add("on"); };
+  es.onerror = () => { if (ind) ind.classList.remove("on"); }; // 自动重连；断开瞬间标灰，重连成功恢复
+  es.onmessage = (e) => {
+    let msg = null;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (!msg || !msg.kind) return;
+    if (msg.kind === "activity") {
+      if (msg.keyId) markInUse(msg.keyId);
+      if (msg.relayId) markInUse(msg.relayId);
+      return; // 流量信号：只点亮，不刷新
+    }
+    if (msg.kind === "event") {
+      state.events.unshift(msg.ev);
+      if (state.events.length > 500) state.events.length = 500;
+      renderEvents();   // 事件日志即时出新条目（尊重过滤器）
+      refreshDebounced();
+    }
+  };
+}
+
 // ---------- 事件绑定 ----------
 document.addEventListener("click", async (e) => {
   const tab = e.target.closest(".tab");
@@ -992,3 +1043,4 @@ makeCombo($("#relayDowngrade"), () => state.goModels);
 refreshAll(true);
 loadAgentGuide();
 setupPolling();
+setupStream();
