@@ -39,7 +39,7 @@
 | `POST` | `/api/keys/{id}/refresh` | 强制刷新该 Key 用量 |
 | `POST` | `/api/keys/{id}/reactivate` | 手动复活（实时查上游，月窗 ok 才放行） |
 | `POST` | `/api/keys/{id}/quarantine` | 手动隔离 |
-| `POST` | `/api/keys/refresh-all` | 批量刷新全部可用 Key 用量（跳过隔离/失效） |
+| `POST` | `/api/keys/refresh-all` | 批量重查全部可用 Key 用量（**并发池上限 6**，跳过隔离/失效；进行中重复触发返回 `409`） |
 | `POST` | `/api/keys/reactivate-all` | 「一键恢复」：全部隔离 Key 重查，月窗已恢复的自动放回池 |
 
 ### 配置与备用通道

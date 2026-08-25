@@ -1633,31 +1633,54 @@ async function handleRefresh(req, res, url) {
   return json(res, 200, { ok: true, key: redactKey(key) });
 }
 
+// 保序并发池：结果顺序与输入一致（同 Promise.all 语义），并发上限 limit。
+// 供 /usage 批量重查（立即刷新 / 后台轮询）使用——每 Key 独立、无跨 Key 状态，
+// worker 池实现：任一完成立即让位给下一个，不整批等齐。
+async function mapPool(items, fn, limit) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+const USAGE_REFRESH_CONCURRENCY = 6; // /usage 批量重查并发上限（常量；8 把 Key happy path 一轮 ≤2 波）
+let refreshAllBusy = false;          // 立即刷新防重入（连点/多端并发触发时 409）
+
 // 批量刷新：与后台轮询 runPoll 同语义（跳过隔离/失效），对每个可用 Key 重查 /usage 并跑状态机。
 // 前端右上角「立即刷新」调它（BUG-009：旧实现只重拉缓存视图，从不触发上游重查）。
+// 2026-08-25：改 mapPool 并发（保序），8 Key 从串行 3-6s / 最坏 160s 降到 ~1s / 最坏 40s。
 async function handleRefreshAll(req, res) {
-  const refreshed = [];
-  for (const key of state.keys) {
-    if (key.status === "invalid" || key.status === "quarantined") continue;
-    if (MOCK) {
-      key.quota = mockUsage(Math.min(100, quotaPercent(key, "rolling") + 7), quotaPercent(key, "weekly"), quotaPercent(key, "monthly"));
-      refreshed.push({ id: key.id, ok: true });
-      continue;
-    }
-    const v = await fetchUsage(key.key);
-    if (!v.ok) {
-      if (v.code === 401) quarantine(key, "auth_invalid");
-      refreshed.push({ id: key.id, ok: false, code: v.code === 401 ? 401 : "usage", msg: v.msg || String(v.code) });
-      continue;
-    }
-    key.quota = toQuota(v.usage);
-    runStateMachine(key);
-    refreshed.push({ id: key.id, ok: true });
+  if (refreshAllBusy) return json(res, 409, { ok: false, msg: "刷新进行中（上一轮批量 /usage 尚未结束）" });
+  refreshAllBusy = true;
+  try {
+    const candidates = state.keys.filter((k) => k.status !== "invalid" && k.status !== "quarantined");
+    const refreshed = await mapPool(candidates, async (key) => {
+      if (MOCK) {
+        key.quota = mockUsage(Math.min(100, quotaPercent(key, "rolling") + 7), quotaPercent(key, "weekly"), quotaPercent(key, "monthly"));
+        return { id: key.id, ok: true };
+      }
+      const v = await fetchUsage(key.key);
+      if (!v.ok) {
+        if (v.code === 401) quarantine(key, "auth_invalid");
+        return { id: key.id, ok: false, code: v.code === 401 ? 401 : "usage", msg: v.msg || String(v.code) };
+      }
+      key.quota = toQuota(v.usage);
+      runStateMachine(key);
+      return { id: key.id, ok: true };
+    }, USAGE_REFRESH_CONCURRENCY);
+    saveState();
+    const okN = refreshed.filter((x) => x.ok).length;
+    addEvent("refresh", null, `refresh-all: ok=${okN} failed=${refreshed.length - okN}`);
+    return json(res, 200, { ok: true, refreshed });
+  } finally {
+    refreshAllBusy = false;
   }
-  saveState();
-  const okN = refreshed.filter((x) => x.ok).length;
-  addEvent("refresh", null, `refresh-all: ok=${okN} failed=${refreshed.length - okN}`);
-  return json(res, 200, { ok: true, refreshed });
 }
 
 async function handleReactivate(req, res, url) {
@@ -1852,12 +1875,13 @@ function schedulePoll() {
 async function runPoll() {
   try {
     if (MOCK) return;
-    for (const key of state.keys) {
-      if (key.status === "invalid") continue;
+    // 2026-08-25：主循环改 mapPool 并发（逐 Key 独立，语义与串行一致，fallback 采样仍在池后串行）
+    await mapPool(state.keys, async (key) => {
+      if (key.status === "invalid") return;
       if (key.status === "quarantined") {
         // 隔离区自动复查（L6 增强）：仅月限隔离且已过续费日+ε 的 Key 才查 /usage；
         // monthly 恢复 → 自动回池；过点仍限 → 标 monthly_dead 停止复查（一次性耗尽，等手动一键查询/激活）
-        if (!quarantineDueForCheck(key)) continue;
+        if (!quarantineDueForCheck(key)) return;
         const v = await fetchUsage(key.key);
         if (!v.ok) {
           // 隔离 Key 遇 401：quarantine() 对已是 quarantined 的状态是空操作，直接标 invalid（与单 Key 激活路径一致）
@@ -1865,20 +1889,20 @@ async function runPoll() {
             key.status = "invalid"; key.quarantineReason = "auth_invalid";
             addEvent("invalid", key.id, "poll check got 401");
           }
-          continue;
+          return;
         }
         const r = activateFromUsage(key, v.usage, "auto (renewal)");
         if (!r.ok && key.quarantineReason !== "monthly_dead") {
           key.quarantineReason = "monthly_dead";
           addEvent("quarantine", key.id, "reason=monthly_dead (past resetsAt, no renewal)");
         }
-        continue;
+        return;
       }
       const v = await fetchUsage(key.key);
-      if (!v.ok) { if (v.code === 401) quarantine(key, "auth_invalid"); continue; }
+      if (!v.ok) { if (v.code === 401) quarantine(key, "auth_invalid"); return; }
       key.quota = toQuota(v.usage);
       runStateMachine(key);
-    }
+    }, USAGE_REFRESH_CONCURRENCY);
     // 备用通道余额采样（balance 模式）：并入现有轮询循环、按 balanceSampleMs 节流，不新增定时器
     const fb = state.config.fallback;
     if (fb && fb.enabled && fb.apiKey && fb.billingMode !== "none") {
@@ -1982,6 +2006,7 @@ if (process.env.GO_NO_LISTEN === "1") {
     goModelsHas, redactRelay, relayConfig, relayEnabled, relayUpstream, relayProbeModels,
     DEFAULT_DOWNGRADE_MODEL, RELAY_FAIL_STREAK_LIMIT, RELAY_QUOTA_RE, INUSE_WINDOW_MS,
     busPublish, notifyActivity, scheduleKeyProbe, cooldownWatchNextDelay, probeState,
+    mapPool, USAGE_REFRESH_CONCURRENCY, refreshAllBusy,
     config: state.config, state,
   };
 } else {

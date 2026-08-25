@@ -156,6 +156,73 @@ function samePoolSet() {
   return dup;
 }
 
+// 总览卡片增量同步：保留 .key-card 元素本体（其上挂 in-use 转圈光效动画）。
+// 背景：refreshAll → render → 全量 innerHTML 重建会销毁/重建卡片元素，CSS 动画随元素重建
+// 每轮从 0° 重启 + conic-gradient 重绘——即「光效时不时卡一下」根因（每分钟轮询 + 结构性事件都会触发）。
+// 策略：顺序稳定（无增删/重排）时按 data-id 原位更新 class 与内部 HTML（内容未变零写入，
+// 动画不中断）；顺序变化（低频）才全量重建。
+function syncCards(grid, items, getId, clsOf, bodyOf) {
+  const cur = Array.from(grid.children);
+  const wantIds = items.map(getId);
+  const orderSame = cur.length === wantIds.length && cur.every((el, i) => el.dataset.id === wantIds[i]);
+  if (!orderSame) {
+    grid.innerHTML = items.map((it) => `<div class="${clsOf(it)}" data-id="${esc(getId(it))}">${bodyOf(it)}</div>`).join("");
+    return;
+  }
+  items.forEach((it, i) => {
+    const el = cur[i];
+    const want = clsOf(it);
+    if (el.className !== want) el.className = want; // in-use 保持原位 → 动画不重启；真离开 → 光效熄灭
+    const body = bodyOf(it);
+    if (el.innerHTML !== body) el.innerHTML = body;
+  });
+}
+
+const relayCardCls = (r) => "key-card relay-card" + (r.status === "quarantined" ? " quarantined" : "") + (r.inUse ? " in-use" : "");
+function relayCardBody(r) {
+  const m = r.goModel || r.model;
+  const shown = m === r.model ? esc(m) : `${esc(m)} → ${esc(r.model)}`;
+  const q = r.status === "quarantined";
+  return `<div class="kc-head">
+    <span class="badge relay-prio">#${esc(r.priority)}</span>
+    ${relayStatusBadge(r)}
+    <span class="kc-label">${esc(r.label)}</span>
+    <span class="kc-actions">
+      ${q ? `<button class="btn small primary" data-act="relay-activate" data-id="${esc(r.id)}" title="重新激活（先探活，通过才回池）">重新激活</button>` : ""}
+      <button class="btn small" data-act="relay-test" data-id="${esc(r.id)}" title="测试连接">⟳</button>
+      <button class="btn small" data-act="relay-edit" data-id="${esc(r.id)}" title="编辑">✎</button>
+      ${q ? "" : `<button class="btn small" data-act="relay-quarantine" data-id="${esc(r.id)}" title="手动停用">⏸</button>`}
+      <button class="btn small" data-act="relay-delete" data-id="${esc(r.id)}" title="删除">🗑</button>
+    </span>
+  </div>
+  <div class="kc-key mono">${shown}</div>
+  <div class="relay-meta">
+    <span>失败 <b>${r.failStreak || 0}/5</b></span>
+    <span>请求 <b>${r.stats ? r.stats.requests : 0}</b></span>
+    <span>最近 <b>${fmtRelative(r.lastReqAt)}</b></span>
+  </div>`;
+}
+
+const keyCardCls = (k, dup) => "key-card" + (dup.has(k.id) ? " same-pool" : "") + (k.inUse ? " in-use" : "");
+function keyCardBody(k) {
+  return `<div class="kc-head">
+    ${statusBadge(k.status)}
+    <span class="kc-label">${esc(k.label)}</span>
+    <span class="kc-actions">
+      <button class="btn small" data-act="refresh" data-id="${esc(k.id)}" title="立即刷新 /usage">⟳</button>
+      <button class="btn small" data-act="quarantine" data-id="${esc(k.id)}" title="手动停用">⏸</button>
+      <button class="btn small" data-act="edit" data-id="${esc(k.id)}" title="编辑">✎</button>
+      <button class="btn small" data-act="delete" data-id="${esc(k.id)}" title="删除">🗑</button>
+    </span>
+  </div>
+  <div class="kc-key mono">${esc(k.key)}</div>
+  <div class="quota-bars">${qbar(k, "rolling")}${qbar(k, "weekly")}${qbar(k, "monthly")}</div>
+  <div class="kc-foot">
+    <span>会话请求 <b>${k.stats ? k.stats.requests : 0}</b></span>
+    <span title="有缓存收益的请求次数（粘住同一把 Key、未因切换丢缓存），非缓存 token 量">缓存命中 <b>${k.stats ? k.stats.cacheHits : 0} 次</b></span>
+  </div>`;
+}
+
 function renderOverview() {
   const st = state.status;
   const counts = st ? st.counts : { active: 0, cooldown: 0, quarantined: 0, invalid: 0 };
@@ -172,59 +239,14 @@ function renderOverview() {
 
   // 优先通道 · 中转站（翠绿识别色；隔离红卡带「重新激活」，充值后一步回池）
   const relays = state.relays || [];
-  $("#relayGrid").innerHTML = relays.map((r) => {
-    const q = r.status === "quarantined";
-    const cls = "key-card relay-card" + (q ? " quarantined" : "") + (r.inUse ? " in-use" : "");
-    const m = r.goModel || r.model;
-    const shown = m === r.model ? esc(m) : `${esc(m)} → ${esc(r.model)}`;
-    return `<div class="${cls}" data-id="${esc(r.id)}">
-      <div class="kc-head">
-        <span class="badge relay-prio">#${esc(r.priority)}</span>
-        ${relayStatusBadge(r)}
-        <span class="kc-label">${esc(r.label)}</span>
-        <span class="kc-actions">
-          ${q ? `<button class="btn small primary" data-act="relay-activate" data-id="${esc(r.id)}" title="重新激活（先探活，通过才回池）">重新激活</button>` : ""}
-          <button class="btn small" data-act="relay-test" data-id="${esc(r.id)}" title="测试连接">⟳</button>
-          <button class="btn small" data-act="relay-edit" data-id="${esc(r.id)}" title="编辑">✎</button>
-          ${q ? "" : `<button class="btn small" data-act="relay-quarantine" data-id="${esc(r.id)}" title="手动停用">⏸</button>`}
-          <button class="btn small" data-act="relay-delete" data-id="${esc(r.id)}" title="删除">🗑</button>
-        </span>
-      </div>
-      <div class="kc-key mono">${shown}</div>
-      <div class="relay-meta">
-        <span>失败 <b>${r.failStreak || 0}/5</b></span>
-        <span>请求 <b>${r.stats ? r.stats.requests : 0}</b></span>
-        <span>最近 <b>${fmtRelative(r.lastReqAt)}</b></span>
-      </div>
-    </div>`;
-  }).join("");
+  syncCards($("#relayGrid"), relays, (r) => r.id, relayCardCls, relayCardBody);
   $("#relayEmpty").classList.toggle("hidden", relays.length > 0);
 
   // 默认通道 · OpenCode Go（现状 + in-use 光效）
   const grid = $("#keyGrid");
   const dup = samePoolSet();
   const activeKeys = state.keys.filter((k) => k.status !== "quarantined" && k.status !== "invalid");
-  grid.innerHTML = activeKeys.map((k) => {
-    const same = dup.has(k.id);
-    return `<div class="key-card${same ? " same-pool" : ""}${k.inUse ? " in-use" : ""}" data-id="${esc(k.id)}">
-      <div class="kc-head">
-        ${statusBadge(k.status)}
-        <span class="kc-label">${esc(k.label)}</span>
-        <span class="kc-actions">
-          <button class="btn small" data-act="refresh" data-id="${esc(k.id)}" title="立即刷新 /usage">⟳</button>
-          <button class="btn small" data-act="quarantine" data-id="${esc(k.id)}" title="手动停用">⏸</button>
-          <button class="btn small" data-act="edit" data-id="${esc(k.id)}" title="编辑">✎</button>
-          <button class="btn small" data-act="delete" data-id="${esc(k.id)}" title="删除">🗑</button>
-        </span>
-      </div>
-      <div class="kc-key mono">${esc(k.key)}</div>
-      <div class="quota-bars">${qbar(k, "rolling")}${qbar(k, "weekly")}${qbar(k, "monthly")}</div>
-      <div class="kc-foot">
-        <span>会话请求 <b>${k.stats ? k.stats.requests : 0}</b></span>
-        <span title="有缓存收益的请求次数（粘住同一把 Key、未因切换丢缓存），非缓存 token 量">缓存命中 <b>${k.stats ? k.stats.cacheHits : 0} 次</b></span>
-      </div>
-    </div>`;
-  }).join("");
+  syncCards(grid, activeKeys, (k) => k.id, (k) => keyCardCls(k, dup), keyCardBody);
 
   $("#overviewEmpty").classList.toggle("hidden", activeKeys.length > 0);
   if (dup.size) showBanner("⚠️ 检测到同池 Key（轮换无效），已红框标出。", false);
@@ -788,6 +810,8 @@ async function actRefresh(id) {
 
 // 右上角「立即刷新」：批量重查全部可用 Key 的 /usage（BUG-009 修复；旧实现只重拉缓存视图）
 async function actRefreshAll() {
+  const btn = $("#btnRefresh");
+  if (btn) btn.disabled = true; // 请求期间禁用，防连点叠加批量 /usage（后端另有 busy 409 兜底）
   try {
     const r = await api("/api/keys/refresh-all", { method: "POST" });
     const list = r.refreshed || [];
@@ -796,6 +820,7 @@ async function actRefreshAll() {
     toast(badN ? `已刷新 ${okN} 个 Key，${badN} 个失败` : `已刷新全部 ${okN} 个 Key`);
   } catch (e) { toast("刷新失败：" + e.message, true); }
   refreshAll(true);
+  if (btn) btn.disabled = false;
 }
 
 async function actQuarantine(id) {
@@ -890,10 +915,25 @@ function switchView(name) {
 }
 
 // ---------- 轮询 ----------
+// 刷新档位持久化（localStorage）：顶栏下拉 + 自动刷新开关为纯前端偏好，刷新页面不重置。
+// 脏值/旧版本存值/隐私模式静默回退默认（1min + 开）；白名单校验防未知档位。
+const REFRESH_PREF_KEY = "og-ui-refresh";
+const REFRESH_TIERS = ["30000", "60000", "300000", "600000", "0"];
+function loadRefreshPref() {
+  try {
+    const p = JSON.parse(localStorage.getItem(REFRESH_PREF_KEY) || "null");
+    return { iv: REFRESH_TIERS.includes(p && p.iv) ? p.iv : "60000", auto: p ? p.auto !== false : true };
+  } catch { return { iv: "60000", auto: true }; }
+}
+function saveRefreshPref() {
+  try { localStorage.setItem(REFRESH_PREF_KEY, JSON.stringify({ iv: refreshDD.get(), auto: $("#autoRefresh").checked })); } catch {}
+}
+
 function setupPolling() {
   clearInterval(pollTimer);
   const iv = Number(refreshDD.get());
   if ($("#autoRefresh").checked && iv > 0) pollTimer = setInterval(() => refreshAll(true), iv);
+  saveRefreshPref(); // 下拉与开关的变更都汇聚到本函数，单点写回
 }
 
 // ---------- 实时推送（SSE，2026-08-25 事件驱动改造） ----------
@@ -1030,9 +1070,11 @@ $("#btnCopyGuide").addEventListener("click", async () => {
 document.addEventListener("click", ddCloseAll);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") ddCloseAll(); });
 
+const refreshPref = loadRefreshPref(); // 持久化档位（脏值/隐私模式静默回退默认 1min+开）
 const refreshDD = makeDD($("#refreshDD"), [
-  { v: "30000", label: "30s" }, { v: "60000", label: "1min" }, { v: "300000", label: "5min" }, { v: "0", label: "关" },
-], "60000", () => setupPolling());
+  { v: "30000", label: "30s" }, { v: "60000", label: "1min" }, { v: "300000", label: "5min" }, { v: "600000", label: "10min" }, { v: "0", label: "关" },
+], refreshPref.iv, () => setupPolling());
+$("#autoRefresh").checked = refreshPref.auto;
 const evDD = makeDD($("#evTypeDD"),
   [{ v: "", label: "全部类型" }].concat(EV_TYPES.map((t) => ({ v: t, label: t, note: EV_EXPLAIN[t] }))),
   "", (v) => { state.evFilter = v; renderEvents(); });
