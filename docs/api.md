@@ -24,6 +24,8 @@
 | `GET` | `/api/events?limit=N` | 事件日志（倒序） |
 | `GET` | `/api/config` | 当前配置（`localToken` 与 `fallback.apiKey` 掩码回显） |
 | `GET` | `/api/fallback` | 备用通道视图（配置 + 余额 + 花费窗口聚合 + 结算记录） |
+| `GET` | `/api/relays` | 中转站列表（apiKey 掩码；含 inUse/连败/统计，按优先级升序） |
+| `GET` | `/api/models` | Go 模型列表缓存（半填半选候选源；启动 + 每轮询刷新） |
 | `GET` | `/api/guide` | Agent 对接指引委派提示词（运行时生成，含本机安装目录/端口） |
 
 ### Key 管理
@@ -43,11 +45,24 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `PATCH` | `/api/config` | 改运行时配置，字段见 [configuration.md](configuration.md) |
+| `PATCH` | `/api/config` | 改运行时配置（含 `relay: {enabled, headerTimeoutMs}`），字段见 [configuration.md](configuration.md) |
 | `PATCH` | `/api/fallback` | 改备用通道配置（字段见 configuration.md；apiKey 掩码回显） |
 | `POST` | `/api/fallback/refresh` | 「立刻计算」：即时采样余额并结算 |
 | `POST` | `/api/fallback/test` | 「测试连接」：用 body 里的候选配置（不必先保存）测可达性 + 计费能力 |
 | `POST` | `/api/events/clear` | 清空事件日志 |
+
+### 中转站
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/relays` | 新增：`{"label","baseURL","apiKey","model","goModel?","downgradeModel?","priority?"}`；priority 默认队尾，冲突自动挤位 |
+| `PATCH` | `/api/relays/{id}` | 编辑字段；apiKey 留空保持；priority 走挤位 |
+| `DELETE` | `/api/relays/{id}` | 删除 |
+| `POST` | `/api/relays/{id}/test` | 测试连接（该站配置 + body 候选覆盖）：最小对话 + 探测 `GET {base}/models`，响应带 `models[]` |
+| `POST` | `/api/relays/test` | 未保存候选配置测试（body 自带 baseURL/apiKey/model） |
+| `POST` | `/api/relays/{id}/activate` | 手动复活：先探活，通过才回池（连败清零） |
+| `POST` | `/api/relays/{id}/quarantine` | 手动停用（reason=manual） |
+| `POST` | `/api/relays/renumber` | 自动重排优先级 1..N |
 
 ## 示例
 

@@ -87,8 +87,14 @@ function defaultState() {
         billingMode: "balance",       // balance=DeepSeek 官方 /user/balance 自动计费 | none=不计费
         balanceSampleMs: 15 * 60 * 1000,
       },
+      relay: {                        // 中转站优先层运行参数（docs/plans/opencode-go-relay-priority-2026-08-25.md）
+        enabled: true,                // 总开关（前端「启用优先通道」）
+        headerTimeoutMs: 30 * 1000,   // 前置尝试响应头超时（快失败降级，防死站拖慢体验）
+      },
     },
     keys: [],
+    relays: [],                       // 中转站台账（每站常单模型、按额度计费）
+    goModels: { list: [], fetchedAt: null }, // Go /v1/models 缓存（降级判定 + 半填半选候选源）
     sessions: [],
     events: [],
     seq: 0,
@@ -105,7 +111,7 @@ function loadState() {
       const d = defaultState();
       state = {
         ...d, ...raw,
-        config: { ...d.config, ...(raw.config || {}), fallback: { ...d.config.fallback, ...((raw.config || {}).fallback || {}) } },
+        config: { ...d.config, ...(raw.config || {}), fallback: { ...d.config.fallback, ...((raw.config || {}).fallback || {}) }, relay: { ...d.config.relay, ...((raw.config || {}).relay || {}) } },
         fallbackState: { ...d.fallbackState, ...(raw.fallbackState || {}) },
       };
       // 迁移清理：旧版持久化的预切换配置（90% 预切换已整体移除）不再回显
@@ -117,6 +123,8 @@ function loadState() {
       if (!Array.isArray(state.fallbackState.samples)) state.fallbackState.samples = [];
       if (!Array.isArray(state.fallbackState.costs)) state.fallbackState.costs = [];
       if (!Array.isArray(state.fallbackState.settlements)) state.fallbackState.settlements = [];
+      if (!Array.isArray(state.relays)) state.relays = [];
+      if (!state.goModels || !Array.isArray(state.goModels.list)) state.goModels = { list: [], fetchedAt: null };
     }
   } catch (e) { log("state load failed: " + e.message); }
 }
@@ -771,6 +779,173 @@ async function tryFallback(res, rawBody, clientHeaders, sessionId, model, starte
   return true;
 }
 
+// ---------------- 中转站优先通道（docs/plans/opencode-go-relay-priority-2026-08-25.md） ----------------
+// 定位：按模型优先路由的通用 OpenAI 上游（每站常单模型、按额度计费）。三层级联 = 中转站(优先) -> Go 池(默认) -> 备用通道(兜底)。
+// Go 池与备用通道代码逐行不动；本层只在 forwardChat 最前面按模型匹配，失败分类隔离（仅手动探活复活）。
+const DEFAULT_DOWNGRADE_MODEL = "deepseek-v4-flash"; // goModel 不在 Go 列表时的降级改写默认（实测在 30 模型列表中）
+const RELAY_QUOTA_RE = /insufficient_quota|quota|余额不足|额度不足|insufficient balance|欠费/i;
+const RELAY_FAIL_STREAK_LIMIT = 5;      // 连续失败兜底隔离阈值（任何一次成功清零）
+const INUSE_WINDOW_MS = 10 * 60 * 1000; // 「使用中」判定窗口：近 10 分钟有流量
+const relayConfig = () => state.config.relay || {};
+const relayEnabled = () => relayConfig().enabled !== false;
+const relayHeaderTimeout = () => Number(relayConfig().headerTimeoutMs) || 30000;
+
+// Go 模型列表缓存：启动 + 每次 runPoll 刷新（公开无鉴权）；失败沿用上次；空缓存时 goModelsHas 视为「在列」保守不改写
+function fetchGoModels() {
+  return new Promise((resolve) => {
+    const opts = {
+      hostname: UPSTREAM_HOST, port: 443, path: UPSTREAM_BASE + "/models", method: "GET",
+      headers: { Accept: "application/json", "User-Agent": OUT_UA }, timeout: 20000,
+    };
+    const req = https.request(opts, (res) => {
+      let b = ""; res.on("data", (c) => (b += c));
+      res.on("end", () => {
+        if (res.statusCode === 200) { try { resolve({ ok: true, ids: JSON.parse(b).data.map((m) => m.id) }); } catch { resolve({ ok: false }); } }
+        else resolve({ ok: false });
+      });
+    });
+    req.on("error", () => resolve({ ok: false }));
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.end();
+  });
+}
+async function refreshGoModels() {
+  if (MOCK) return;
+  if (state.goModels.fetchedAt && Date.now() - new Date(state.goModels.fetchedAt).getTime() < 60 * 1000) return; // 60s 节流
+  const v = await fetchGoModels();
+  if (v.ok) { state.goModels.list = v.ids; state.goModels.fetchedAt = new Date().toISOString(); saveState(); }
+}
+function goModelsHas(model) {
+  if (!model) return true;
+  return !state.goModels.list.length || state.goModels.list.includes(model);
+}
+
+function redactRelay(r) {
+  const { apiKey, ...rest } = r;
+  return { ...rest, apiKey: apiKey ? "(set)" : null };
+}
+function isolateRelay(relay, reason, detail) {
+  if (relay.status !== "quarantined") {
+    relay.status = "quarantined";
+    relay.quarantinedAt = new Date().toISOString();
+    relay.quarantineReason = reason;
+    relay.lastError = detail;
+    addEvent("relay-isolate", relay.id, "reason=" + reason + " (" + detail + ")");
+  }
+}
+function activateRelay(relay) {
+  if (relay.status !== "active") {
+    relay.status = "active";
+    relay.quarantinedAt = null;
+    relay.quarantineReason = null;
+    relay.lastError = null;
+    addEvent("relay-recover", relay.id, "back to active (manual probe ok)");
+  }
+}
+// 优先级挤位：把 relay 放到 target，原 target 及之后的其它站依次 +1（编号保持连续、全局唯一）
+function setRelayPriority(relay, target) {
+  const busy = state.relays.some((r) => r.id !== relay.id && r.priority === target);
+  if (busy) for (const r of state.relays) if (r.id !== relay.id && r.priority >= target) r.priority += 1;
+  relay.priority = target;
+  addEvent("relay-edit", relay.id, "priority -> " + target);
+}
+// 匹配：enabled 且 active 且 (goModel||model)===请求模型，按 priority 升序（同模型完全按序试完再进 Go，用户定稿）
+function matchRelays(model) {
+  if (!relayEnabled()) return [];
+  return state.relays
+    .filter((r) => r.enabled !== false && r.status === "active" && (r.goModel || r.model) === model)
+    .sort((a, b) => (a.priority || 0) - (b.priority || 0) || a.id.localeCompare(b.id));
+}
+// 失败分类（方案 §3.2）：401 立即隔离 auth；402 或 429|403+关键词 立即隔离 quota；其余 failStreak+1，≥5 隔离 streak
+function classifyRelayError(relay, out) {
+  const status = out.status;
+  const body = String(out.body || "");
+  if (status === 401) return isolateRelay(relay, "auth_invalid", "401 (key invalid)");
+  if (status === 402 || ((status === 429 || status === 403) && RELAY_QUOTA_RE.test(body))) return isolateRelay(relay, "quota", "HTTP " + status + " quota exhausted");
+  relay.failStreak = (relay.failStreak || 0) + 1;
+  if (relay.failStreak >= RELAY_FAIL_STREAK_LIMIT) isolateRelay(relay, "streak", "HTTP " + status + " x" + relay.failStreak);
+}
+function relayUpstream(baseURL) {
+  let u; try { u = new URL(baseURL); } catch { return null; }
+  return {
+    lib: u.protocol === "http:" ? http : https,
+    hostname: u.hostname,
+    port: u.port ? Number(u.port) : u.protocol === "http:" ? 80 : 443,
+    path: u.pathname.replace(/\/+$/, "") + "/chat/completions",
+    base: u.pathname.replace(/\/+$/, ""),
+  };
+}
+// 请求体：model 改写为中转站侧名；OpenAI 标准字段白名单（同备用通道）；不注入 reasoning_effort（客户端值经白名单透传）
+function buildRelayBody(payload, withUsage, relay) {
+  const body = { model: relay.model, messages: payload.messages };
+  for (const k of FALLBACK_BODY_FIELDS) if (payload[k] !== undefined) body[k] = payload[k];
+  if (withUsage && body.stream) body.stream_options = { ...(body.stream_options || {}), include_usage: true };
+  return body;
+}
+// 前置尝试：响应头超时 = config.relay.headerTimeoutMs（默认 30s）快失败，流式阶段沿用 300s
+function attemptRelay(relay, rawBody, clientHeaders, withUsage) {
+  return new Promise((resolve) => {
+    let payload; try { payload = JSON.parse(rawBody.toString("utf8")); } catch { return resolve({ stream: false, status: 400, body: "invalid JSON" }); }
+    const body = JSON.stringify(buildRelayBody(payload, withUsage, relay));
+    const up = relayUpstream(relay.baseURL);
+    if (!up) return resolve({ stream: false, status: 502, body: JSON.stringify({ error: { message: "bad baseURL" } }) });
+    const headers = {
+      Authorization: "Bearer " + relay.apiKey, "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body), "User-Agent": OUT_UA,
+      Accept: clientHeaders.accept || "text/event-stream",
+    };
+    if (clientHeaders["x-request-id"]) headers["x-request-id"] = clientHeaders["x-request-id"];
+    const req = up.lib.request({ hostname: up.hostname, port: up.port, path: up.path, method: "POST", headers, timeout: 300000 }, (r) => {
+      clearTimeout(headerTimer);
+      try { req.setTimeout(300000); } catch {}
+      if (r.statusCode >= 200 && r.statusCode < 300) return resolve({ stream: true, res: r });
+      let b = ""; r.on("data", (c) => (b += c));
+      r.on("end", () => resolve({ stream: false, status: r.statusCode, body: b }));
+    });
+    const headerTimer = setTimeout(() => req.destroy(new Error("header timeout")), relayHeaderTimeout());
+    req.on("error", (e) => resolve({ stream: false, status: 502, body: JSON.stringify({ error: { message: e.message } }) }));
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.end(body);
+  });
+}
+const relayUsageRecorder = (relay) => (u) => {
+  relay.stats.totalTokens = (relay.stats.totalTokens || 0) + (u.prompt_tokens || 0) + (u.completion_tokens || 0);
+  saveState();
+};
+// 优先层主入口：返回 { handled:true } = 已由中转站处理；否则 { body } = 降级模型改写后的转发体（未改写则不设）
+async function tryRelayPriority(res, upBody, clientHeaders, sessionId, model, started) {
+  const candidates = matchRelays(model);
+  if (!candidates.length) return {};
+  for (const relay of candidates) {
+    if (relay.status !== "active") continue; // 循环中刚被隔离的不再试
+    inflightInc(relay.id);
+    let out = await attemptRelay(relay, upBody, clientHeaders, true);
+    if (!out.stream && out.status === 400) out = await attemptRelay(relay, upBody, clientHeaders, false); // include_usage 降级重试（沿备用通道先例）
+    if (out.stream) {
+      relay.failStreak = 0;
+      relay.lastReqAt = new Date().toISOString();
+      const pseudo = { id: relay.id, label: relay.label, stats: relay.stats };
+      streamThrough(res, out.res, pseudo, sessionId, model, started, relayUsageRecorder(relay)); // finishRequest 负责 inflightDec
+      saveState();
+      return { handled: true };
+    }
+    inflightDec(relay.id);
+    classifyRelayError(relay, out);
+    addEvent("relay-fail", relay.id, "HTTP " + out.status + " streak=" + relay.failStreak + (relay.status !== "active" ? " isolated(" + relay.quarantineReason + ")" : ""));
+  }
+  saveState();
+  // 全部失败 -> 降级模型改写：首个命中站的 goModel 不在 Go 列表时，改写为该站 downgradeModel（默认 deepseek-v4-flash）
+  const c0 = candidates[0];
+  const goModel = c0.goModel || c0.model;
+  const down = c0.downgradeModel || DEFAULT_DOWNGRADE_MODEL;
+  if (goModel && down && !goModelsHas(goModel)) {
+    let payload; try { payload = JSON.parse(upBody.toString("utf8")); } catch { return {}; }
+    payload.model = down;
+    return { handled: false, body: Buffer.from(JSON.stringify(payload)) };
+  }
+  return {};
+}
+
 // GET /v1/models 透传：ZCode 启动时探测模型/思考能力，必须 200 而非 404（公开无鉴权端点）
 function forwardModels(res) {
   const up = https.request({
@@ -808,6 +983,10 @@ function forwardChat(req, res) {
       payload.stream_options = { ...(payload.stream_options || {}), include_usage: true };
       try { upBody = Buffer.from(JSON.stringify(payload)); } catch { upBody = rawBody; }
     }
+    // 中转站优先层（三层级联第 1 层）：按模型匹配的中转站完全按序试完，才进 Go 池（方案 relay-priority §3.2）
+    const relayed = await tryRelayPriority(res, upBody, { accept: req.headers.accept, "x-request-id": req.headers["x-request-id"] }, sessionId, model, started);
+    if (relayed.handled) return;
+    if (relayed.body) upBody = relayed.body; // 降级模型改写后的转发体（goModel 不在 Go 列表 -> downgradeModel）
     const key = getOrBindKey(sessionId);
     if (!key) {
       // 无可用 Key：先试备用通道（通用 OpenAI 上游，三窗口语义触发），不行再按 L4 如实回 429 + 最近恢复时间
@@ -858,19 +1037,23 @@ function summarize() {
     else if (k.status === "quarantined") counts.quarantined++;
     else if (k.status === "invalid") counts.invalid++;
   }
+  const relayActive = state.relays.filter((r) => r.enabled !== false && r.status === "active").length;
   const totalRequests = state.keys.reduce((a, k) => a + (k.stats ? k.stats.requests : 0), 0);
   const totalCached = state.keys.reduce((a, k) => a + (k.stats ? k.stats.cachedTokens : 0), 0);
   // 总 token = Go 池各 key 累计 + 备用通道各请求（注入 include_usage 后由流末 usage 块统计）
   const totalTokens = state.keys.reduce((a, k) => a + (k.stats && k.stats.totalTokens ? k.stats.totalTokens : 0), 0)
     + state.fallbackState.costs.reduce((a, c) => a + ((c.promptTokens || 0) + (c.completionTokens || 0)), 0);
-  return { version: VERSION, mode: MOCK ? "mock" : "real", uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000), counts, totalRequests, totalTokens, totalCachedTokens: totalCached, stateUpdatedAt: state.updatedAt };
+  return { version: VERSION, mode: MOCK ? "mock" : "real", uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000), counts, relayActive, totalRequests, totalTokens, totalCachedTokens: totalCached, stateUpdatedAt: state.updatedAt };
+}
+
+function keyInUse(k) {
+  if ((inflight.get(k.id) || 0) > 0) return true;
+  const now = Date.now();
+  return state.sessions.some((s) => s.keyId === k.id && s.lastActive && now - new Date(s.lastActive).getTime() < INUSE_WINDOW_MS);
 }
 
 function apiKeyList() {
-  return state.keys.map((k) => {
-    const r = redactKey(k);
-    return r;
-  });
+  return state.keys.map((k) => ({ ...redactKey(k), inUse: keyInUse(k) }));
 }
 
 function samePoolWarnings() {
@@ -996,6 +1179,150 @@ async function handleFallbackTest(req, res) {
   });
 }
 
+// ---------------- 中转站：列表 / 录入 / 编辑 / 删除 / 测试 / 复活 / 停用 / 重排 + 模型列表 ----------------
+function relayInUse(r) {
+  if ((inflight.get(r.id) || 0) > 0) return true;
+  if (!r.lastReqAt) return false;
+  return Date.now() - new Date(r.lastReqAt).getTime() < INUSE_WINDOW_MS;
+}
+function handleRelayList(req, res) {
+  const list = state.relays.slice().sort((a, b) => (a.priority || 0) - (b.priority || 0) || a.id.localeCompare(b.id));
+  return json(res, 200, { relays: list.map((r) => ({ ...redactRelay(r), inUse: relayInUse(r), inflight: inflight.get(r.id) || 0 })) });
+}
+async function handleRelayEnroll(req, res) {
+  const body = await readBody(req);
+  if (body == null) return jsonError(res, 400, "invalid body");
+  const baseURL = (body.baseURL || "").trim();
+  const apiKey = (body.apiKey || "").trim();
+  const model = (body.model || "").trim();
+  if (!/^https?:\/\//.test(baseURL)) return jsonError(res, 400, "baseURL 须以 http(s):// 开头");
+  if (apiKey.length < 8) return jsonError(res, 400, "apiKey 至少 8 字符");
+  if (!model) return jsonError(res, 400, "model 必填");
+  const label = (body.label || "").trim() || "中转站-" + (state.relays.length + 1);
+  const relay = {
+    id: "r" + (++state.seq), label, baseURL, apiKey, model,
+    goModel: (body.goModel || "").trim() || model,
+    downgradeModel: (body.downgradeModel || "").trim() || DEFAULT_DOWNGRADE_MODEL,
+    priority: 0, enabled: body.enabled !== false,
+    status: "active", quarantineReason: null, quarantinedAt: null,
+    failStreak: 0, lastError: null, lastReqAt: null,
+    stats: { requests: 0, totalTokens: 0, cachedTokens: 0, cacheHits: 0 },
+  };
+  state.relays.push(relay);
+  const p = Number.isInteger(body.priority) && body.priority >= 1 ? body.priority : state.relays.reduce((a, r) => Math.max(a, r.priority || 0), 0) + 1;
+  setRelayPriority(relay, p); // 挤位；新站默认 max+1（队尾）
+  addEvent("relay-edit", relay.id, "created (priority=" + relay.priority + ")");
+  saveState();
+  return json(res, 201, { ok: true, relay: redactRelay(relay) });
+}
+async function handleRelayPatch(req, res, url) {
+  const id = url.pathname.split("/")[3];
+  const relay = state.relays.find((r) => r.id === id);
+  if (!relay) return jsonError(res, 404, "relay not found");
+  const body = await readBody(req);
+  if (body == null) return jsonError(res, 400, "invalid body");
+  if (typeof body.label === "string" && body.label.trim()) relay.label = body.label.trim();
+  if (typeof body.baseURL === "string" && body.baseURL.trim()) {
+    if (!/^https?:\/\//.test(body.baseURL.trim())) return jsonError(res, 400, "baseURL 须以 http(s):// 开头");
+    relay.baseURL = body.baseURL.trim();
+  }
+  if (typeof body.apiKey === "string" && body.apiKey.trim().length >= 8) relay.apiKey = body.apiKey.trim();
+  if (typeof body.model === "string" && body.model.trim()) relay.model = body.model.trim();
+  if (typeof body.goModel === "string") relay.goModel = body.goModel.trim() || relay.model;
+  if (typeof body.downgradeModel === "string") relay.downgradeModel = body.downgradeModel.trim() || DEFAULT_DOWNGRADE_MODEL;
+  if (typeof body.enabled === "boolean") relay.enabled = body.enabled;
+  if (Number.isInteger(body.priority) && body.priority >= 1) setRelayPriority(relay, body.priority);
+  addEvent("relay-edit", relay.id, "updated");
+  saveState();
+  return json(res, 200, { ok: true, relay: redactRelay(relay) });
+}
+function handleRelayDelete(req, res, url) {
+  const id = url.pathname.split("/")[3];
+  const i = state.relays.findIndex((r) => r.id === id);
+  if (i < 0) return jsonError(res, 404, "relay not found");
+  const [removed] = state.relays.splice(i, 1);
+  addEvent("relay-edit", id, "deleted: " + removed.label);
+  saveState();
+  return json(res, 200, { ok: true });
+}
+function handleRelayRenumber(req, res) {
+  const sorted = state.relays.slice().sort((a, b) => (a.priority || 0) - (b.priority || 0) || a.id.localeCompare(b.id));
+  sorted.forEach((r, i) => { r.priority = i + 1; });
+  addEvent("relay-edit", null, "renumbered 1.." + sorted.length);
+  saveState();
+  return json(res, 200, { ok: true, relays: sorted.map(redactRelay) });
+}
+// 探测中转站模型列表（半填半选候选源）；非 200 / 解析失败回 null = 该站不支持
+function relayProbeModels(baseURL, apiKey) {
+  let u; try { u = new URL(baseURL); } catch { return Promise.resolve(null); }
+  const lib = u.protocol === "http:" ? http : https;
+  const base = u.pathname.replace(/\/+$/, "");
+  return new Promise((resolve) => {
+    const req = lib.request({
+      hostname: u.hostname, port: u.port ? Number(u.port) : u.protocol === "http:" ? 80 : 443,
+      path: base + "/models", method: "GET",
+      headers: { Authorization: "Bearer " + apiKey, Accept: "application/json", "User-Agent": OUT_UA }, timeout: 20000,
+    }, (r) => {
+      let b = ""; r.on("data", (c) => (b += c));
+      r.on("end", () => {
+        if (r.statusCode !== 200) return resolve(null);
+        try { return resolve(JSON.parse(b).data.map((m) => m.id)); } catch { return resolve(null); }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => req.destroy(new Error("timeout")));
+    req.end();
+  });
+}
+// 未保存候选配置也能测（沿 handleFallbackTest 模式，无需已存在的中转站 id）
+async function handleRelayTestCandidate(req, res) {
+  const body = (await readBody(req)) || {};
+  const baseURL = (body.baseURL || "").trim();
+  const apiKey = (body.apiKey || "").trim();
+  const model = (body.model || "").trim();
+  if (!/^https?:\/\//.test(baseURL) || apiKey.length < 8 || !model) return json(res, 200, { ok: false, msg: "需填写 Base URL / API Key / 模型名再测试" });
+  const chat = MOCK ? { ok: true, status: 200, body: "(mock)" } : await fallbackProbeChat(baseURL, apiKey, model);
+  const models = MOCK ? ["glm-5.3", "deepseek-v4-flash"] : await relayProbeModels(baseURL, apiKey);
+  addEvent("relay-test", null, "candidate chat=" + (chat.ok ? "OK(" + chat.status + ")" : "FAIL(" + (chat.status || chat.msg) + ")"));
+  return json(res, 200, { ok: true, chat, models });
+}
+async function handleRelayTest(req, res, url) {
+  const id = url.pathname.split("/")[3];
+  const relay = state.relays.find((r) => r.id === id);
+  if (!relay) return jsonError(res, 404, "relay not found");
+  const body = (await readBody(req)) || {};
+  const baseURL = (typeof body.baseURL === "string" && body.baseURL.trim()) ? body.baseURL.trim() : relay.baseURL;
+  const apiKey = (typeof body.apiKey === "string" && body.apiKey.trim().length >= 8) ? body.apiKey.trim() : relay.apiKey;
+  const model = (typeof body.model === "string" && body.model.trim()) ? body.model.trim() : relay.model;
+  if (!apiKey) return json(res, 200, { ok: false, msg: "未配置 API Key" });
+  const chat = MOCK ? { ok: true, status: 200, body: "(mock)" } : await fallbackProbeChat(baseURL, apiKey, model);
+  const models = MOCK ? ["glm-5.3", "deepseek-v4-flash"] : await relayProbeModels(baseURL, apiKey);
+  addEvent("relay-test", relay.id, "chat=" + (chat.ok ? "OK(" + chat.status + ")" : "FAIL(" + (chat.status || chat.msg) + ")") + " models=" + (models ? models.length + "" : "unsupported"));
+  return json(res, 200, { ok: true, chat, models });
+}
+async function handleRelayActivate(req, res, url) {
+  const id = url.pathname.split("/")[3];
+  const relay = state.relays.find((r) => r.id === id);
+  if (!relay) return jsonError(res, 404, "relay not found");
+  if (MOCK) { activateRelay(relay); relay.failStreak = 0; saveState(); return json(res, 200, { ok: true, status: "active" }); }
+  const chat = await fallbackProbeChat(relay.baseURL, relay.apiKey, relay.model);
+  if (chat.ok) { relay.failStreak = 0; activateRelay(relay); saveState(); return json(res, 200, { ok: true, status: "active" }); }
+  relay.lastError = "probe failed HTTP " + (chat.status || chat.msg);
+  saveState();
+  return json(res, 200, { ok: false, status: "quarantined", msg: "探活失败（HTTP " + (chat.status || chat.msg) + "）— 保持隔离" });
+}
+function handleRelayQuarantine(req, res, url) {
+  const id = url.pathname.split("/")[3];
+  const relay = state.relays.find((r) => r.id === id);
+  if (!relay) return jsonError(res, 404, "relay not found");
+  isolateRelay(relay, "manual", "manual pause");
+  saveState();
+  return json(res, 200, { ok: true, status: relay.status });
+}
+function handleModels(req, res) {
+  return json(res, 200, { models: state.goModels.list || [], fetchedAt: state.goModels.fetchedAt || null });
+}
+
 // ---------------- MOCK_MODE 合成剧本 ----------------
 function mockUsage(rollingPct, weeklyPct, monthlyPct, rollingStatus, weeklyStatus, monthlyStatus, monthlyDays) {
   const now = Date.now();
@@ -1008,7 +1335,9 @@ function mockUsage(rollingPct, weeklyPct, monthlyPct, rollingStatus, weeklyStatu
 }
 
 function ensureMockData() {
-  if (!MOCK || state.keys.length) return;
+  if (!MOCK) return;
+  if (state.keys.length && state.relays.length) return;
+  if (!state.keys.length) {
   const base = "sk-mock-";
   const mk = (label, status, ws, u, reason, stats) => ({
     id: "k" + (++state.seq), label, key: base + label.toLowerCase().replace(/\W+/g, ""), status, workspaceId: ws,
@@ -1035,6 +1364,23 @@ function ensureMockData() {
     ev("cooldown", "k3", "entered cooldown_weekly (weekly)", 300), ev("quarantine", "k5", "reason=monthly", 60 * 26),
     ev("recover", "k2", "back to active (window ok)", 60 * 30), ev("failover", "k1", "HTTP 429 -> key k2", 240)
   );
+  }
+  if (!state.relays.length) {
+    const rmk = (id, label, model, goModel, priority, status, reason, streak, requests) => ({
+      id, label, baseURL: "https://example.com/v1", apiKey: "sk-mock-" + id, model, goModel,
+      downgradeModel: "deepseek-v4-flash", priority, enabled: true, status,
+      quarantineReason: reason, quarantinedAt: status === "quarantined" ? new Date(Date.now() - 3600e3).toISOString() : null,
+      failStreak: streak, lastError: reason === "quota" ? "HTTP 429 quota exhausted" : null,
+      lastReqAt: status === "active" ? new Date(Date.now() - 60e3).toISOString() : null,
+      stats: { requests, totalTokens: requests * 1500, cachedTokens: 0, cacheHits: 0 },
+    });
+    state.relays.push(
+      rmk("r1", "中转站-A", "glm-5.3", "glm-5.3", 1, "active", null, 0, 42),
+      rmk("r2", "中转站-B（额度耗尽）", "deepseek-v4-flash", "deepseek-v4-flash", 2, "quarantined", "quota", 0, 200),
+      rmk("r3", "中转站-C（连败 2/5）", "deepseek-v4-pro", "deepseek-v4-pro", 3, "active", null, 2, 9)
+    );
+  }
+  if (!state.goModels.list.length) state.goModels.list = ["glm-5.3", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro", "kimi-k3", "qwen3.8-max"]; // MOCK 半填半选演示候选
   saveState();
 }
 
@@ -1095,6 +1441,17 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && p === "/api/fallback/refresh") return handleFallbackRefresh(req, res);
   if (req.method === "POST" && p === "/api/fallback/test") return handleFallbackTest(req, res);
   if (req.method === "PATCH" && p === "/api/fallback") return handleFallbackPatch(req, res);
+
+  if (req.method === "GET" && p === "/api/relays") return handleRelayList(req, res);
+  if (req.method === "POST" && p === "/api/relays") return handleRelayEnroll(req, res);
+  if (req.method === "POST" && p === "/api/relays/renumber") return handleRelayRenumber(req, res);
+  if (req.method === "POST" && p === "/api/relays/test") return handleRelayTestCandidate(req, res);
+  if (req.method === "POST" && p.startsWith("/api/relays/") && p.endsWith("/test")) return handleRelayTest(req, res, url);
+  if (req.method === "POST" && p.startsWith("/api/relays/") && p.endsWith("/activate")) return handleRelayActivate(req, res, url);
+  if (req.method === "POST" && p.startsWith("/api/relays/") && p.endsWith("/quarantine")) return handleRelayQuarantine(req, res, url);
+  if (req.method === "PATCH" && p.startsWith("/api/relays/")) return handleRelayPatch(req, res, url);
+  if (req.method === "DELETE" && p.startsWith("/api/relays/")) return handleRelayDelete(req, res, url);
+  if (req.method === "GET" && p === "/api/models") return handleModels(req, res);
 
   if (req.method === "POST" && p === "/api/keys") return handleEnroll(req, res);
   if (req.method === "POST" && p === "/api/keys/refresh-all") return handleRefreshAll(req, res);
@@ -1312,6 +1669,10 @@ async function handlePatchConfig(req, res) {
   if (typeof body.retryEmptyResponse === "boolean") c.retryEmptyResponse = body.retryEmptyResponse;
   if (typeof body.localToken === "string" && body.localToken.length >= 4) c.localToken = body.localToken;
   if (body.localToken === "") c.localToken = null;
+  if (body.relay && typeof body.relay === "object") {
+    if (typeof body.relay.enabled === "boolean") c.relay.enabled = body.relay.enabled;
+    if (Number.isInteger(body.relay.headerTimeoutMs) && body.relay.headerTimeoutMs >= 5000 && body.relay.headerTimeoutMs <= 120000) c.relay.headerTimeoutMs = body.relay.headerTimeoutMs;
+  }
   addEvent("config", null, "runtime config updated");
   saveState();
   return json(res, 200, { ok: true, config: maskedConfig() });
@@ -1333,6 +1694,25 @@ function mockChat(req, res) {
     try { payload = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch {}
     const model = payload.model || "mock-model";
     const sessionId = req.headers["x-session-id"] || null;
+    // MOCK 中转站优先层（演示）：命中 relay 返回合成 SSE 并更新 stats
+    const mrelays = matchRelays(model);
+    if (mrelays.length) {
+      const r = mrelays[0];
+      r.failStreak = 0; r.lastReqAt = new Date().toISOString();
+      r.stats.requests += 1; r.stats.totalTokens = (r.stats.totalTokens || 0) + 15;
+      saveState();
+      res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store" });
+      const rid = "mock-relay-" + Date.now();
+      res.write(`data: ${JSON.stringify({ id: rid, object: "chat.completion.chunk", model: r.model, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`);
+      setTimeout(() => {
+        res.write(`data: ${JSON.stringify({ id: rid, object: "chat.completion.chunk", model: r.model, choices: [{ index: 0, delta: { content: "[mock] 中转站优先 #" + r.priority + " " + r.label + " → " + r.model }, finish_reason: null }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: rid, object: "chat.completion.chunk", model: r.model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: rid, object: "chat.completion", model: r.model, choices: [], usage: { prompt_tokens: 10, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 0 } } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }, 150);
+      return;
+    }
     const key = getOrBindKey(sessionId); // 与真实路径同调度：粘性 + 会话到期优先 / 无会话轻松优先
     if (!key) {
       // 兜底（MOCK 演示）：无可用 key 且备用通道就绪 → 合成备用 SSE 流（真实路径见 tryFallback）
@@ -1379,6 +1759,7 @@ function mockChat(req, res) {
 let pollTimer = null;
 function schedulePoll() {
   if (pollTimer) clearTimeout(pollTimer);
+  if (!MOCK) refreshGoModels(); // 模型列表低频刷新（每轮询周期一次；内部 60s 节流）
   pollTimer = setTimeout(runPoll, Math.max(5 * 1000, state.config.pollIntervalMs));
 }
 async function runPoll() {
@@ -1491,13 +1872,16 @@ if (process.env.GO_NO_LISTEN === "1") {
     streamThrough, quarantineDueForCheck, activateFromUsage,
     noUsableKey, buildFallbackBody, fallbackUpstream, fallbackWindowCost, fallbackWindowCount,
     markFallbackStart, markFallbackEnd, recordBalanceSample, fallbackConfig, fallbackReady,
+    matchRelays, classifyRelayError, buildRelayBody, setRelayPriority, isolateRelay, activateRelay,
+    goModelsHas, redactRelay, relayConfig, relayEnabled, relayUpstream, relayProbeModels,
+    DEFAULT_DOWNGRADE_MODEL, RELAY_FAIL_STREAK_LIMIT, RELAY_QUOTA_RE, INUSE_WINDOW_MS,
     config: state.config, state,
   };
 } else {
   server.on("error", (e) => { if (e.code === "EADDRINUSE") log("FATAL: port " + PORT + " already in use"); else log("server error: " + e.message); process.exit(1); });
   server.listen(PORT, "127.0.0.1", () => {
     log(`OpenCode Go gateway v${VERSION} listening on http://127.0.0.1:${PORT} (mode=${MOCK ? "mock" : "real"})`);
-    if (!MOCK) { schedulePoll(); scheduleCooldownWatch(5 * 1000); } // 看护首轮 5s：重启后尽快补查断开期间过点的冷却 Key
+    if (!MOCK) { refreshGoModels(); schedulePoll(); scheduleCooldownWatch(5 * 1000); } // 看护首轮 5s：重启后尽快补查断开期间过点的冷却 Key
   });
 
   for (const sig of ["SIGINT", "SIGTERM"]) {

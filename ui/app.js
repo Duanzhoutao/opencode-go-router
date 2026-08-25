@@ -21,12 +21,16 @@ const REASON_CN = {
 
 let state = {
   status: null, keys: [], sessions: [], events: [], config: null, fallback: null, evFilter: "",
+  relays: [], goModels: [],
 };
 let currentView = "overview";
 let pollTimer = null;
 let fbDirty = false;       // 备用通道表单编辑中：不被自动刷新覆盖
 let cfgDirty = false;      // 设置表单编辑中：不被自动刷新覆盖
 let fbWin = "h24";         // 费用时间窗选中项
+let relayDirty = false;    // 中转站表单编辑中：不被自动刷新覆盖
+let relayEditId = null;    // 正在编辑的中转站 id（null = 新增模式）
+let relayModels = [];      // 最近测试连接探测到的中转站模型列表（中转站模型名候选源）
 
 // ---------- 工具 ----------
 function toast(msg, isErr) {
@@ -84,11 +88,14 @@ async function api(path, opts) {
 
 async function refreshAll(silent) {
   try {
-    const [st, k, se, ev, cfg, fb] = await Promise.all([
+    // relay/models 属新端点：后端（旧进程）暂缺时降级为空，不拖垮整个仪表盘（否则 render 永不执行、开关全部失灵）
+    const [st, k, se, ev, cfg, fb, r, m] = await Promise.all([
       api("/api/status"), api("/api/keys"), api("/api/sessions"),
       api("/api/events?limit=60"), api("/api/config"), api("/api/fallback"),
+      api("/api/relays").catch(() => ({ relays: [] })),
+      api("/api/models").catch(() => ({ models: [] })),
     ]);
-    state.status = st; state.keys = k.keys; state.sessions = se.sessions; state.events = ev.events; state.config = cfg.config; state.fallback = fb;
+    state.status = st; state.keys = k.keys; state.sessions = se.sessions; state.events = ev.events; state.config = cfg.config; state.fallback = fb; state.relays = r.relays || []; state.goModels = m.models || [];
     render();
   } catch (e) {
     showBanner("无法连接网关：" + e.message, true);
@@ -103,6 +110,7 @@ function render() {
   renderKeys();
   renderQuarantine();
   renderSessions();
+  renderRelays();
   renderFallback();
   renderEvents();
   renderSettings();
@@ -151,22 +159,54 @@ function samePoolSet() {
 function renderOverview() {
   const st = state.status;
   const counts = st ? st.counts : { active: 0, cooldown: 0, quarantined: 0, invalid: 0 };
+  const relayActive = st ? (st.relayActive || 0) : 0;
   $("#statCards").innerHTML = [
     ["active", counts.active, "可用"],
     ["cooldown", counts.cooldown, "冷却"],
     ["quarantined", counts.quarantined, "隔离"],
     ["invalid", counts.invalid, "失效"],
+    ["relay", relayActive, "优先中"],
     ["requests", st ? st.totalRequests : 0, "总请求"],
     ["cached", fmtTokens(st ? st.totalTokens : 0), "总 token"],
   ].map(([cls, num, lbl]) => `<div class="stat ${cls}"><div class="num">${num}</div><div class="lbl">${lbl}</div></div>`).join("");
 
+  // 优先通道 · 中转站（翠绿识别色；隔离红卡带「重新激活」，充值后一步回池）
+  const relays = state.relays || [];
+  $("#relayGrid").innerHTML = relays.map((r) => {
+    const q = r.status === "quarantined";
+    const cls = "key-card relay-card" + (q ? " quarantined" : "") + (r.inUse ? " in-use" : "");
+    const m = r.goModel || r.model;
+    const shown = m === r.model ? esc(m) : `${esc(m)} → ${esc(r.model)}`;
+    return `<div class="${cls}" data-id="${esc(r.id)}">
+      <div class="kc-head">
+        <span class="badge relay-prio">#${esc(r.priority)}</span>
+        ${relayStatusBadge(r)}
+        <span class="kc-label">${esc(r.label)}</span>
+        <span class="kc-actions">
+          ${q ? `<button class="btn small primary" data-act="relay-activate" data-id="${esc(r.id)}" title="重新激活（先探活，通过才回池）">重新激活</button>` : ""}
+          <button class="btn small" data-act="relay-test" data-id="${esc(r.id)}" title="测试连接">⟳</button>
+          <button class="btn small" data-act="relay-edit" data-id="${esc(r.id)}" title="编辑">✎</button>
+          ${q ? "" : `<button class="btn small" data-act="relay-quarantine" data-id="${esc(r.id)}" title="手动停用">⏸</button>`}
+          <button class="btn small" data-act="relay-delete" data-id="${esc(r.id)}" title="删除">🗑</button>
+        </span>
+      </div>
+      <div class="kc-key mono">${shown}</div>
+      <div class="relay-meta">
+        <span>失败 <b>${r.failStreak || 0}/5</b></span>
+        <span>请求 <b>${r.stats ? r.stats.requests : 0}</b></span>
+        <span>最近 <b>${fmtRelative(r.lastReqAt)}</b></span>
+      </div>
+    </div>`;
+  }).join("");
+  $("#relayEmpty").classList.toggle("hidden", relays.length > 0);
+
+  // 默认通道 · OpenCode Go（现状 + in-use 光效）
   const grid = $("#keyGrid");
   const dup = samePoolSet();
-
   const activeKeys = state.keys.filter((k) => k.status !== "quarantined" && k.status !== "invalid");
   grid.innerHTML = activeKeys.map((k) => {
     const same = dup.has(k.id);
-    return `<div class="key-card${same ? " same-pool" : ""}" data-id="${esc(k.id)}">
+    return `<div class="key-card${same ? " same-pool" : ""}${k.inUse ? " in-use" : ""}" data-id="${esc(k.id)}">
       <div class="kc-head">
         ${statusBadge(k.status)}
         <span class="kc-label">${esc(k.label)}</span>
@@ -354,7 +394,218 @@ async function refreshFallbackCost() {
   refreshAll(true);
 }
 
-const EV_TYPES = ["bind", "migrate", "enroll", "cooldown", "rate-limited", "failover", "quarantine", "recover", "reactivate", "invalid", "exhausted", "cache-hit", "same-workspace-alert", "upstream-5xx", "empty-stream", "delete", "edit", "config", "refresh", "fallback", "fallback:start", "fallback:end", "fallback:fail", "fallback-test"];
+// ---------- 中转站优先通道视图 ----------
+const RELAY_STREAK_LIMIT = 5;
+const RELAY_REASON_CN = { quota: "额度耗尽", streak: "连续失败隔离", auth_invalid: "认证失效", manual: "手动停用", unverified: "未验证" };
+const RELAY_STATUS_LABEL = { active: "优先中", quarantined: "隔离" };
+
+function fmtRelative(iso) {
+  if (!iso) return "—";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 60000) return "刚刚";
+  const m = Math.floor(ms / 60000);
+  if (m < 60) return m + " 分钟前";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + " 小时前";
+  return Math.floor(h / 24) + " 天前";
+}
+
+function relayStatusBadge(r) {
+  const s = r.status === "quarantined" ? "quarantined" : "active";
+  return `<span class="badge status-${s}">${RELAY_STATUS_LABEL[r.status] || r.status}</span>`;
+}
+// 模型映射展示：两侧同名只显示一个；不同显「请求名 → 发出名」
+function relayMapText(r) {
+  const m = r.goModel || r.model;
+  return m === r.model ? m : m + " → " + r.model;
+}
+
+function renderRelays() {
+  const relays = state.relays || [];
+  const cfg = state.config || {};
+  if (!relayDirty) $("#relayEnabledGlobal").checked = !cfg.relay || cfg.relay.enabled !== false;
+  const active = relays.filter((r) => r.status !== "quarantined");
+  const quarantined = relays.filter((r) => r.status === "quarantined");
+  const tb = $("#relayTable tbody");
+  tb.innerHTML = active.length ? active.map((r) => `<tr>
+    <td><b>${esc(r.priority)}</b></td>
+    <td><b>${esc(r.label)}</b></td>
+    <td class="mono">${esc(relayMapText(r))}</td>
+    <td>${relayStatusBadge(r)}${r.enabled === false ? ' <span class="tag">停用</span>' : ""}</td>
+    <td>${r.failStreak || 0}/5</td>
+    <td>${r.stats ? r.stats.requests : 0}</td>
+    <td class="mono">${r.lastReqAt ? fmtTs(r.lastReqAt) : "—"}</td>
+    <td>
+      <button class="btn small" data-act="relay-test" data-id="${esc(r.id)}">测试</button>
+      <button class="btn small" data-act="relay-edit" data-id="${esc(r.id)}">编辑</button>
+      <button class="btn small" data-act="relay-quarantine" data-id="${esc(r.id)}">停用</button>
+      <button class="btn small" data-act="relay-delete" data-id="${esc(r.id)}">删除</button>
+    </td>
+  </tr>`).join("")
+    : `<tr><td colspan="8" style="color:var(--muted)">暂无中转站——用上方表单添加。</td></tr>`;
+  const qtb = $("#relayQTable tbody");
+  qtb.innerHTML = quarantined.length ? quarantined.map((r) => `<tr>
+    <td><b>${esc(r.priority)}</b></td>
+    <td><b>${esc(r.label)}</b></td>
+    <td>${esc(RELAY_REASON_CN[r.quarantineReason] || r.quarantineReason || "—")}</td>
+    <td class="mono">${fmtTs(r.quarantinedAt)}</td>
+    <td class="mono" title="${esc(r.lastError || "")}">${esc((r.lastError || "—").slice(0, 40))}</td>
+    <td>
+      <button class="btn small primary" data-act="relay-activate" data-id="${esc(r.id)}">重新激活</button>
+      <button class="btn small" data-act="relay-delete" data-id="${esc(r.id)}">删除</button>
+    </td>
+  </tr>`).join("")
+    : `<tr><td colspan="6" style="color:var(--muted)">无隔离中转站——额度耗尽或连续失败的中转站会出现在这里（仅可手动重新激活）。</td></tr>`;
+  if (!relayDirty) fillRelayForm(relayEditId ? relays.find((x) => x.id === relayEditId) : null);
+}
+
+function fillRelayForm(r) {
+  $("#relayLabel").value = r ? r.label : "";
+  $("#relayBaseURL").value = r ? r.baseURL : "";
+  $("#relayApiKey").value = "";
+  $("#relayApiKey").placeholder = r && r.apiKey === "(set)" ? "已保存（留空保持不变）" : "sk-…（仅存本机，不回显）";
+  $("#relayModel").value = r ? r.model : "";
+  $("#relayGoModel").value = r ? (r.goModel === r.model ? "" : r.goModel) : "";
+  $("#relayDowngrade").value = r ? (r.downgradeModel === "deepseek-v4-flash" ? "" : r.downgradeModel) : "";
+  $("#relayPriority").value = r ? r.priority : "";
+  $("#relaySubmit").textContent = r ? "保存修改" : "添加中转站";
+  $("#btnRelayCancelEdit").classList.toggle("hidden", !r);
+  $("#relayFormHint").textContent = "";
+}
+
+async function saveRelay(e) {
+  e.preventDefault();
+  const body = {
+    label: $("#relayLabel").value.trim(),
+    baseURL: $("#relayBaseURL").value.trim(),
+    model: $("#relayModel").value.trim(),
+    goModel: $("#relayGoModel").value.trim(),
+    downgradeModel: $("#relayDowngrade").value.trim(),
+    enabled: true,
+  };
+  const prio = Number($("#relayPriority").value);
+  if (Number.isInteger(prio) && prio >= 1) body.priority = prio;
+  const k = $("#relayApiKey").value.trim();
+  if (k) body.apiKey = k;
+  try {
+    if (relayEditId) {
+      await api(`/api/relays/${relayEditId}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      toast("中转站已更新");
+    } else {
+      await api("/api/relays", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      toast("中转站已添加（配错会连续失败后自动隔离）");
+    }
+    relayEditId = null; relayDirty = false;
+    fillRelayForm(null);
+  } catch (err) { toast(err.message, true); }
+  refreshAll(true);
+}
+
+// 未保存配置也能测：POST /api/relays/test 把表单当候选配置探活 + 探测模型列表
+async function testRelayForm() {
+  const btn = $("#btnRelayTest"); btn.disabled = true;
+  const hint = $("#relayFormHint");
+  hint.textContent = "测试中…（最小请求 + 探测模型列表）";
+  try {
+    const body = { baseURL: $("#relayBaseURL").value.trim(), model: $("#relayModel").value.trim() };
+    const k = $("#relayApiKey").value.trim();
+    if (k) body.apiKey = k;
+    const r = await api("/api/relays/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) { hint.textContent = "❌ " + (r.msg || "测试失败"); return; }
+    const chat = r.chat || {};
+    hint.textContent = chat.ok
+      ? `✅ 连接成功（HTTP ${chat.status}）· ${r.models ? `探测到 ${r.models.length} 个模型（中转站模型名可选）` : "该站不支持模型列表（中转站模型名请手填）"}`
+      : `❌ 连接失败（HTTP ${chat.status}${chat.msg ? " " + chat.msg : ""}）——检查 Base URL / Key / 模型名`;
+    if (Array.isArray(r.models)) relayModels = r.models;
+  } catch (e) { hint.textContent = "❌ 测试失败：" + e.message; }
+  finally { btn.disabled = false; }
+}
+
+async function actRelayTest(id) {
+  try {
+    const r = await api(`/api/relays/${id}/test`, { method: "POST" });
+    const chat = r.chat || {};
+    toast(chat.ok ? `✅ 连接成功 · 模型 ${r.models ? r.models.length + " 个" : "不可探测"}` : `❌ HTTP ${chat.status || chat.msg}`);
+    if (Array.isArray(r.models)) relayModels = r.models;
+  } catch (e) { toast(e.message, true); }
+  refreshAll(true);
+}
+function actRelayEdit(id) {
+  const r = state.relays.find((x) => x.id === id);
+  if (!r) return;
+  relayEditId = id; relayDirty = true;
+  fillRelayForm(r);
+  if (currentView !== "relays") switchView("relays");
+  $("#relayForm").scrollIntoView();
+}
+async function actRelayActivate(id) {
+  try {
+    const r = await api(`/api/relays/${id}/activate`, { method: "POST" });
+    toast(r.ok ? "已重新激活（探活通过，回池）" : (r.msg || "保持隔离"));
+  } catch (e) { toast(e.message, true); }
+  refreshAll(true);
+}
+async function actRelayQuarantine(id) {
+  const r = state.relays.find((x) => x.id === id);
+  if (!(await uiDialog({ title: "手动停用中转站", message: `停用「${r ? r.label : id}」？停用后不参与调度，需手动重新激活。`, confirmText: "停用", danger: true }))) return;
+  try { await api(`/api/relays/${id}/quarantine`, { method: "POST" }); toast("已停用"); } catch (e) { toast(e.message, true); }
+  refreshAll(true);
+}
+async function actRelayDelete(id) {
+  const r = state.relays.find((x) => x.id === id);
+  if (!(await uiDialog({ title: "彻底删除中转站", message: `彻底删除「${r ? r.label : id}」？此操作不可恢复。`, confirmText: "删除", danger: true }))) return;
+  try {
+    await api(`/api/relays/${id}`, { method: "DELETE" });
+    toast("已删除");
+    if (relayEditId === id) cancelRelayEdit();
+  } catch (e) { toast(e.message, true); }
+  refreshAll(true);
+}
+async function actRelayRenumber() {
+  try { await api("/api/relays/renumber", { method: "POST" }); toast("已自动重排 1..N"); } catch (e) { toast(e.message, true); }
+  refreshAll(true);
+}
+async function toggleRelayGlobal(e) {
+  try {
+    await api("/api/config", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ relay: { enabled: e.target.checked } }) });
+    toast(e.target.checked ? "优先通道已启用" : "优先通道已关闭（全部请求直走 Go 池）");
+  } catch (err) { toast(err.message, true); }
+  refreshAll(true);
+}
+function cancelRelayEdit() { relayEditId = null; relayDirty = false; fillRelayForm(null); }
+
+// 半填半选：输关键字实时过滤候选（大小写不敏感），点选填入；也允许纯手填自由文本
+// 候选源：Go 字段 = 网关缓存模型列表；中转站字段 = 最近测试连接探测到的模型列表
+function makeCombo(input, getOptions) {
+  if (!input) return;
+  const pop = document.createElement("div");
+  pop.className = "dd-pop";
+  document.body.appendChild(pop);
+  let current = [];
+  const close = () => pop.classList.remove("show");
+  const open = () => {
+    const kw = input.value.trim().toLowerCase();
+    current = (getOptions() || []).filter((o) => String(o).toLowerCase().includes(kw)).slice(0, 20);
+    if (!current.length) { close(); return; }
+    pop.innerHTML = current.map((o, i) => `<div class="dd-opt" data-i="${i}"><span class="dd-label">${esc(o)}</span></div>`).join("");
+    pop.classList.add("show");
+    const r = input.getBoundingClientRect();
+    const pw = pop.offsetWidth, ph = pop.offsetHeight, vw = window.innerWidth, vh = window.innerHeight;
+    let top = r.bottom + 6;
+    if (top + ph > vh - 8 && r.top - ph - 6 >= 8) top = r.top - ph - 6;
+    pop.style.top = Math.max(8, top) + "px";
+    pop.style.left = Math.min(Math.max(8, r.left), Math.max(8, vw - pw - 8)) + "px";
+    pop.style.minWidth = Math.max(220, r.width) + "px";
+    ddOpenClose = close;
+  };
+  const pick = (i) => { input.value = current[i]; input.dispatchEvent(new Event("input", { bubbles: true })); close(); };
+  input.addEventListener("input", open);
+  input.addEventListener("focus", open);
+  pop.addEventListener("mousedown", (e) => e.preventDefault()); // 防失焦先于点击
+  pop.addEventListener("click", (e) => { const opt = e.target.closest(".dd-opt"); if (opt) pick(Number(opt.dataset.i)); });
+}
+
+const EV_TYPES = ["bind", "migrate", "enroll", "cooldown", "rate-limited", "failover", "quarantine", "recover", "reactivate", "invalid", "exhausted", "cache-hit", "same-workspace-alert", "upstream-5xx", "empty-stream", "delete", "edit", "config", "refresh", "fallback", "fallback:start", "fallback:end", "fallback:fail", "fallback-test", "relay-fail", "relay-isolate", "relay-recover", "relay-test", "relay-edit"];
 
 // 事件类型解释（悬停标签 / 下拉选项小注共用；标签本身保持英文 type）
 const EV_EXPLAIN = {
@@ -382,6 +633,11 @@ const EV_EXPLAIN = {
   "fallback:end": "备用周期结束（切回 Go 并结算花费）",
   "fallback:fail": "备用通道请求失败",
   "fallback-test": "备用通道测试连接",
+  "relay-fail": "中转站前置请求失败（记录连败计数）",
+  "relay-isolate": "中转站被隔离（额度耗尽/连败/401/手动）",
+  "relay-recover": "中转站手动复活成功（探活通过）",
+  "relay-test": "中转站测试连接",
+  "relay-edit": "中转站配置变更（新增/编辑/删除/重排）",
 };
 
 function renderEvents() {
@@ -654,6 +910,11 @@ document.addEventListener("click", async (e) => {
     if (a === "reactivate") actReactivate(id);
     if (a === "delete") actDelete(id);
     if (a === "edit") actEdit(id);
+    if (a === "relay-test") actRelayTest(id);
+    if (a === "relay-edit") actRelayEdit(id);
+    if (a === "relay-activate") actRelayActivate(id);
+    if (a === "relay-quarantine") actRelayQuarantine(id);
+    if (a === "relay-delete") actRelayDelete(id);
   }
 });
 
@@ -664,6 +925,13 @@ $("#btnFbTest").addEventListener("click", testFallback);
 $("#btnFbRefresh").addEventListener("click", refreshFallbackCost);
 $("#fallbackForm").addEventListener("input", () => { fbDirty = true; });
 $("#fallbackForm").addEventListener("change", () => { fbDirty = true; });
+$("#relayForm").addEventListener("submit", saveRelay);
+$("#btnRelayTest").addEventListener("click", testRelayForm);
+$("#btnRelayCancelEdit").addEventListener("click", cancelRelayEdit);
+$("#btnRelayRenumber").addEventListener("click", actRelayRenumber);
+$("#relayEnabledGlobal").addEventListener("change", toggleRelayGlobal);
+$("#relayForm").addEventListener("input", () => { relayDirty = true; });
+$("#relayForm").addEventListener("change", () => { relayDirty = true; });
 $("#fbWindows").addEventListener("click", (e) => {
   const b = e.target.closest("[data-win]");
   if (!b) return;
@@ -714,6 +982,11 @@ const fbBillingDD = makeDD($("#fbBillingDD"), [
   { v: "balance", label: "自动计费", note: "DeepSeek 官方余额差值" },
   { v: "none", label: "不计费", note: "其他 OpenAI 端点" },
 ], "balance");
+
+// 半填半选接线：中转站模型名用最近探测列表，Go 字段用网关缓存的 Go 模型列表
+makeCombo($("#relayModel"), () => relayModels);
+makeCombo($("#relayGoModel"), () => state.goModels);
+makeCombo($("#relayDowngrade"), () => state.goModels);
 
 // ---------- 启动 ----------
 refreshAll(true);

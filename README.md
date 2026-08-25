@@ -1,6 +1,6 @@
 # OpenCode Go Router
 
-**多 Key 本地路由网关**：一个本机 Node 进程持有多个 OpenCode Go Key，对 OpenAI 兼容的 Agent 客户端（ZCode / OpenCode / Claude Code 生态）呈现为一个普通 `127.0.0.1` provider——按会话粘性 + 限额调度自动选 Key，Key 用尽自动切换/隔离，全部不可用时自动走备用通道，零依赖、零改造接入。
+**多 Key 本地路由网关**：一个本机 Node 进程持有多个 OpenCode Go Key，对 OpenAI 兼容的 Agent 客户端（ZCode / OpenCode / Claude Code 生态）呈现为一个普通 `127.0.0.1` provider——按会话粘性 + 限额调度自动选 Key，Key 用尽自动切换/隔离，全部不可用时自动走备用通道；也支持把第三方**中转站**（单模型、按额度计费）按模型优先接入，失败自动降级回 Go 池。零依赖、零改造接入。
 
 > ⚠️ 非官方项目，与 opencode.ai 无任何关联。「OpenCode Go」是其付费订阅产品，本仓库只做本地 Key 配额管理。
 
@@ -21,10 +21,11 @@ OpenCode Go 订阅的每个 Key 有 **5 小时滚动 / 每周 / 每月** 三重�
 - **限额感知调度**：每 15 分钟轮询 `/usage` 三窗口用量（5h 滚动 / 周 / 月，含 `resetsAt`）；会话流量按**月到期优先**（月窗到期未用完的额度随续费作废，先花马上到期的），无会话流量按**最轻松优先**（路由到余量最大的 Key）。
 - **透明 failover**：上游 429 实时冷却对应窗口（`limitName` 按关键词归一，5h 窗口上游实际叫 "5 hour"）后缓冲首字节自动换下一个可用 Key（failoverChain 兜底），对客户端无感知。
 - **备用通道（通用 OpenAI 协议兜底）**：全部 Go Key 不可用时自动切到任意 OpenAI 兼容上游（默认 DeepSeek 官方，火山方舟等均可），请求模型自动改写、思考强度默认拉满（`reasoning_effort=max`，各厂取值不同，可改或留空交上游默认）；任一 Go Key 恢复立刻切回。DeepSeek 官方可选**余额差值自动计费**（人民币快照差值 + 15 分钟采样 + 关网关补结算），其他端点不计费模式。
+- **中转站优先通道（按模型优先路由）**：把第三方中转站（OpenAI 兼容端点，每站常只支持一个模型、按额度计费）按模型**优先**接入——请求模型命中某中转站就先走它（同一模型多站按优先级全序尝试），全部失败才降级回 Go 池，三层级联 = 中转站（优先）→ Go 池（默认）→ 备用通道（兜底）。额度耗尽（402，或 429/403 带 quota/余额关键词）**立即隔离**，识别不了则**连续失败 5 次**自动隔离（成功清零）、隔离后仅手动「重新激活」（先探活，通过才回池）；Go 缺该模型时降级改写为可配的「降级模型」（默认 `deepseek-v4-flash`）；模型名支持映射（应对中转站命名漂移）与**半填半选**（输关键字过滤候选）；仪表盘「使用中」卡片有转圈流光特效。
 - **空回复重试优化（`retryEmptyResponse`，默认关）**：上游长思考后偶发零正文空流，客户端会判 `empty_model_response` 且不重试；打开后网关在首个正文字节前缓冲整条流，空回复则零字节掐断连接，触发客户端网络级自动重试（代价：思考不实时滚动）。默认关，需要时设置页打开。
 - **同池检测**：从 429 响应 metadata 提取 workspace id，同 workspace 的 Key 标记「同池」并告警——提示轮换它们无效。
 - **状态机管理**：`active / cooldown_rolling / cooldown_weekly / quarantined / invalid` 五态 + 冷却截止时间；月限 Key 按重置时钟自动复查回池；支持手动停用、删除、复活、隔离。
-- **浏览器仪表盘**：七视图单页（总览 / Key 管理 / 隔离区 / 会话绑定 / 备用通道 / 事件日志 / 设置），用量条三档分色（绿 <90% / 金 ≥90% / 红 ≥100%），事件类型悬停有中文解释。
+- **浏览器仪表盘**：八视图单页（总览 / Key 管理 / 隔离区 / 会话绑定 / 中转站 / 备用通道 / 事件日志 / 设置），总览分「优先通道 · 中转站 / 默认通道 · OpenCode Go」两区，用量条三档分色（绿 <90% / 金 ≥90% / 红 ≥100%），「使用中」卡片转圈流光，事件类型悬停有中文解释。
 - **Agent 对接指引**：设置页一段可复制的委派提示词（运行时生成，自动带本机安装目录与端口），发给你的 AI 助手即可代为完成接入。
 - **可选本地鉴权**：`localToken` 设置后，转发面与控制面都要求 `Bearer` 头，防止本机其他进程借用网关。
 - **每 Key 并发上限**（默认 5）与丢缓存保护。
@@ -132,7 +133,11 @@ ZCode 配置示例：
   |---------------------------> quarantined（月限隔离，月窗重置自动复活）
   |-- 401/退订 --------------------> invalid（无效，需手动删除）
 
-全部不可用 ——> 备用通道兜底（启用且配置就绪时）；任一 Key 恢复 ——> 自动切回
+请求(model=M)
+  └─ 中转站优先层：命中且 active 的中转站按优先级全序尝试
+        └─ 全部失败 / 无匹配
+             └─> OpenCode Go 池（粘性 + 到期优先 / 最轻松优先 + failover 链）
+                   └─ 全部不可用 ──> 备用通道兜底（启用且配置就绪时）；任一 Key 恢复 ──> 自动切回
 ```
 
 冷却到窗口 `resetsAt` 过点后由 30 秒看护定向重查即时回池（不等 15 分钟轮询；网关重启后自动补查断开期间过点的 Key）；月限隔离按月窗重置时钟复查回池。
@@ -160,6 +165,15 @@ ZCode 配置示例：
 | `GET` / `PATCH` | `/api/fallback` | 读/改备用通道配置（baseURL/模型/Key/计费模式/思考强度） |
 | `POST` | `/api/fallback/refresh` | 备用费用「立刻计算」 |
 | `POST` | `/api/fallback/test` | 备用通道「测试连接」（支持未保存的候选配置） |
+| `GET` | `/api/relays` | 中转站列表（Key 掩码、含 inUse/连败/统计） |
+| `POST` | `/api/relays` | 新增中转站（baseURL/Key/模型/优先级，冲突自动挤位） |
+| `PATCH` / `DELETE` | `/api/relays/{id}` | 编辑 / 删除中转站 |
+| `POST` | `/api/relays/{id}/test` | 中转站「测试连接」（顺带探测模型列表） |
+| `POST` | `/api/relays/test` | 未保存候选配置测试 |
+| `POST` | `/api/relays/{id}/activate` | 手动复活中转站（先探活，通过才回池） |
+| `POST` | `/api/relays/{id}/quarantine` | 手动停用中转站 |
+| `POST` | `/api/relays/renumber` | 自动重排优先级 1..N |
+| `GET` | `/api/models` | Go 模型列表缓存（中转站模型字段半填半选候选源） |
 | `GET` | `/api/guide` | Agent 对接指引提示词（运行时生成） |
 
 `PATCH /api/config` 支持的字段与范围：
@@ -172,7 +186,7 @@ ZCode 配置示例：
 | `retryEmptyResponse` | `false` | bool（空回复重试优化，默认关=完全透明直通；需要时打开） |
 | `localToken` | `null` | 字符串 ≥4 字符；设空字符串清除 |
 
-完整 API 说明与示例见 [docs/api.md](docs/api.md)，全部配置（含备用通道八字段）见 [docs/configuration.md](docs/configuration.md)。
+完整 API 说明与示例见 [docs/api.md](docs/api.md)，全部配置（含备用通道八字段、中转站字段）见 [docs/configuration.md](docs/configuration.md)。
 
 ## 环境变量
 
@@ -198,13 +212,13 @@ ZCode 配置示例：
 完整文档在 [`docs/`](docs/README.md)，面向人和 AI 助手、按当前版本实际行为编写：
 
 - [docs/README.md](docs/README.md) — 文档索引与按问题导航
-- [architecture.md](docs/architecture.md) — 工作原理：请求生命周期、粘性与缓存、调度、状态机、备用通道与计费
+- [architecture.md](docs/architecture.md) — 工作原理：请求生命周期、粘性与缓存、调度、状态机、中转站优先通道、备用通道与计费
 - [client-integration.md](docs/client-integration.md) — ZCode / OpenCode / 任意客户端接入 + MCP 说明
 - [guard.md](docs/guard.md) — go-guard 钩子机制与跟随启停（配置、单例、排障）
-- [configuration.md](docs/configuration.md) — keys.json、运行时配置、备用通道、环境变量
+- [configuration.md](docs/configuration.md) — keys.json、运行时配置、备用通道、中转站配置、环境变量
 - [api.md](docs/api.md) — 转发面与控制面 HTTP API 参考
-- [admin-ui.md](docs/admin-ui.md) — 仪表盘七视图与事件类型表
-- [faq.md](docs/faq.md) — 常见问题（钩子、MCP、429/隔离、空回复、计费）
+- [admin-ui.md](docs/admin-ui.md) — 仪表盘八视图与事件类型表
+- [faq.md](docs/faq.md) — 常见问题（钩子、MCP、429/隔离、空回复、中转站、计费）
 
 ## 目录结构
 

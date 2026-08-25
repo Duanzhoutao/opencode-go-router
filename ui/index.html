@@ -36,6 +36,7 @@
   <button data-view="keys" class="tab">Key 管理</button>
   <button data-view="quarantine" class="tab">隔离区</button>
   <button data-view="sessions" class="tab">会话绑定</button>
+  <button data-view="relays" class="tab">中转站</button>
   <button data-view="fallback" class="tab">备用通道</button>
   <button data-view="events" class="tab">事件日志</button>
   <button data-view="settings" class="tab">设置</button>
@@ -47,6 +48,10 @@
   <!-- 总览 -->
   <section id="view-overview" class="view active">
     <div class="stat-row" id="statCards"></div>
+    <div class="section-title relay"><span class="dot-led"></span>优先通道 · 中转站</div>
+    <div class="key-grid" id="relayGrid"></div>
+    <div id="relayEmpty" class="empty hidden">还没有中转站——去 <button class="btn link" data-goto="relays">中转站</button> 添加一个（按模型优先路由）。</div>
+    <div class="section-title go"><span class="dot-led"></span>默认通道 · OpenCode Go</div>
     <div class="key-grid" id="keyGrid"></div>
     <div id="overviewEmpty" class="empty hidden">
       还没有 Key——去 <button class="btn link" data-goto="keys">Key 管理</button> 添加一把。
@@ -96,6 +101,49 @@
       <h2>会话绑定</h2>
       <p class="hint" title="按 x-session-id 把会话固定到同一把 Key（缓存按 workspace 累积，健康绑定绝不迁移）；两个会话绑同一把 Key（同池）会有提示。">同一会话固定用同一把 Key，以积累缓存。</p>
       <table class="tbl" id="sessTable"><thead><tr><th>会话 ID</th><th>绑定 Key</th><th>模型</th><th>请求数</th><th>最后活动</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- 中转站 -->
+  <section id="view-relays" class="view">
+    <div class="card">
+      <div class="events-head">
+        <h2>中转站</h2>
+        <button class="btn" id="btnRelayRenumber" title="按当前列表顺序重编优先级 1..N（修复手动编辑产生的空洞）">自动重排</button>
+      </div>
+      <label class="inline" style="margin-bottom:6px"><input type="checkbox" id="relayEnabledGlobal"> 启用优先通道</label>
+      <p class="hint">按模型优先路由，全部失败才降级 OpenCode Go 池；隔离后只能手动重新激活。</p>
+      <details class="mech">
+        <summary>机制说明</summary>
+        <div class="mech-body">
+          匹配对象是「Go 侧模型名」（留空则用中转站模型名）；同一模型的多台中转站按优先级（数字小优先）依次尝试。额度耗尽（HTTP 402，或 429/403 带 quota/余额关键词）立即隔离，识别不了连续失败 5 次自动隔离；隔离后点「重新激活」会先探活，通过才回池。goModel 不在 Go 模型列表时，降级请求改写为「降级模型」（默认 deepseek-v4-flash）。
+        </div>
+      </details>
+      <form id="relayForm" class="form-col" style="margin-top:8px">
+        <div class="form-row">
+          <input type="text" id="relayLabel" placeholder="名称（如：中转站-A）" autocomplete="off">
+          <input type="number" id="relayPriority" min="1" max="99" step="1" placeholder="优先级 1 最优先" style="flex:0 1 170px" autocomplete="off">
+        </div>
+        <label>Base URL<input type="text" id="relayBaseURL" placeholder="https://…/v1（OpenAI 兼容端点）" autocomplete="off"></label>
+        <label>API Key<input type="password" id="relayApiKey" placeholder="sk-…（仅存本机，不回显）" autocomplete="off"></label>
+        <label>中转站模型名（实际发出）<input type="text" id="relayModel" placeholder="输关键字选择或手填，如 GLM-5.3" autocomplete="off"></label>
+        <label>Go 侧模型名（请求匹配；留空=同上）<input type="text" id="relayGoModel" placeholder="输关键字选择或手填，如 glm-5.3" autocomplete="off"></label>
+        <label>降级模型（Go 缺该模型时改写）<input type="text" id="relayDowngrade" placeholder="默认 deepseek-v4-flash" autocomplete="off"></label>
+        <div class="form-row">
+          <button class="btn primary" type="submit" id="relaySubmit">添加中转站</button>
+          <button class="btn" type="button" id="btnRelayTest">测试连接</button>
+          <button class="btn hidden" type="button" id="btnRelayCancelEdit">取消编辑</button>
+        </div>
+        <p class="hint" id="relayFormHint"></p>
+      </form>
+    </div>
+    <div class="card">
+      <h2>列表</h2>
+      <table class="tbl" id="relayTable"><thead><tr><th>优先级</th><th>名称</th><th>模型映射</th><th>状态</th><th>失败</th><th>请求</th><th>最近使用</th><th>操作</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>隔离</h2>
+      <table class="tbl" id="relayQTable"><thead><tr><th>优先级</th><th>名称</th><th>原因</th><th>隔离时间</th><th>最近错误</th><th>操作</th></tr></thead><tbody></tbody></table>
     </div>
   </section>
 

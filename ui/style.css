@@ -250,6 +250,7 @@ main {
 .stat.cooldown .num { color: var(--warn); }
 .stat.quarantined .num { color: var(--danger); }
 .stat.invalid .num { color: var(--invalid); }
+.stat.relay .num { color: var(--ok); }
 
 /* ---- Key 卡片 ---- */
 .key-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 14px; }
@@ -272,10 +273,43 @@ main {
   border-color: rgba(201,80,58,0.5);
   box-shadow: 0 0 0 1px rgba(201,80,58,0.25), var(--shadow);
 }
+
+/* ---- 总览双分区标题（优先通道翠绿 / 默认通道琥珀） ---- */
+.section-title {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--serif); font-weight: 700; font-size: 15px; color: var(--ink-soft);
+  margin: 22px 0 11px; letter-spacing: 0.3px;
+}
+.section-title .dot-led { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.section-title.relay .dot-led { background: var(--ok); box-shadow: 0 0 0 3px rgba(45,154,95,0.16); }
+.section-title.go .dot-led { background: var(--accent); box-shadow: 0 0 0 3px rgba(200,134,45,0.16); }
+
+/* ---- 「使用中」转圈彗星流光（@property 角度动画，Chromium 85+） ----
+   Go 卡琥珀 / 中转站卡翠绿：光色同时回答「哪个在用」与「哪类套餐在用」 */
+@property --glow { syntax: '<angle>'; initial-value: 0deg; inherits: false; }
+@keyframes glowSpin { to { --glow: 360deg; } }
+@keyframes glowBreathe { 0%,100% { box-shadow: var(--shadow); } 50% { box-shadow: 0 8px 32px rgba(200,134,45,0.30), 0 0 18px rgba(200,134,45,0.35); } }
+@keyframes glowBreatheRelay { 0%,100% { box-shadow: var(--shadow); } 50% { box-shadow: 0 8px 32px rgba(45,154,95,0.30), 0 0 18px rgba(45,154,95,0.35); } }
+.key-card.in-use {
+  border: 1.5px solid transparent;
+  background:
+    linear-gradient(var(--glass), var(--glass)) padding-box,
+    conic-gradient(from var(--glow), transparent 0 74%, rgba(232,165,74,0.13) 88%, rgba(232,165,74,0.95) 96%, transparent 100%) border-box;
+  animation: glowSpin 3s linear infinite, glowBreathe 3s ease-in-out infinite;
+}
+.key-card.relay-card.in-use {
+  background:
+    linear-gradient(var(--glass), var(--glass)) padding-box,
+    conic-gradient(from var(--glow), transparent 0 74%, rgba(90,196,138,0.13) 88%, rgba(90,196,138,0.95) 96%, transparent 100%) border-box;
+  animation: glowSpin 3s linear infinite, glowBreatheRelay 3s ease-in-out infinite;
+}
+.badge.relay-prio { background: linear-gradient(135deg, var(--ok-soft), #7fd4a4); color: #1e6b42; font-weight: 700; }
+.key-card.relay-card.quarantined { border-color: rgba(201,80,58,0.5); box-shadow: 0 0 0 1px rgba(201,80,58,0.25), var(--shadow); }
+.relay-meta { margin-top: 10px; font-size: 12px; color: var(--ink-soft); display: flex; gap: 12px; flex-wrap: wrap; position: relative; z-index: 1; }
 .kc-head { display: flex; align-items: center; gap: 9px; position: relative; z-index: 1; }
 .kc-label { font-family: var(--serif); font-weight: 700; font-size: 16px; }
-.kc-actions { margin-left: auto; display: flex; gap: 4px; }
-.kc-actions .btn { padding: 3px 8px; font-size: 13px; }
+.kc-actions { margin-left: auto; display: flex; gap: 4px; align-items: center; }
+.kc-actions .btn { padding: 3px 8px; font-size: 13px; white-space: nowrap; flex: none; }
 .kc-key { color: var(--ink-soft); margin-top: 4px; font-family: var(--mono); font-size: 12px; position: relative; z-index: 1; }
 .quota-bars { margin: 12px 0 10px; display: flex; flex-direction: column; gap: 7px; position: relative; z-index: 1; }
 .qbar-row { display: grid; grid-template-columns: 38px 1fr 124px; align-items: center; gap: 9px; font-size: 12px; }
