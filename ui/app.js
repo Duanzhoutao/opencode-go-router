@@ -939,10 +939,17 @@ function setupStream() {
       return; // 流量信号：只点亮，不刷新
     }
     if (msg.kind === "event") {
-      state.events.unshift(msg.ev);
+      const ev = msg.ev;
+      state.events.unshift(ev);
       if (state.events.length > 500) state.events.length = 500;
       renderEvents();   // 事件日志即时出新条目（尊重过滤器）
-      refreshDebounced();
+      // 纯单 key 流量事件（缓存命中/空回复）：只点亮光效、不进整页对账——
+      // cache-hit 高频（长会话几乎每请求命中），若触发 refreshAll 会在活跃编码期造成整页 1~2s 一次重渲染
+      if (ev.type === "cache-hit" || ev.type === "empty-stream") {
+        if (ev.keyId) markInUse(ev.keyId);
+        return;
+      }
+      refreshDebounced(); // 结构性事件（bind/cooldown/quarantine/recover/relay-*/fallback-*/config）：整页对账
     }
   };
 }

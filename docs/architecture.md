@@ -75,7 +75,7 @@ OpenCode Go 的上下文缓存**跟随 Key**：换一把 Key，缓存全部失�
 `addEvent` 是网关的领域事件总线：全部结构性状态变化（bind/cooldown/quarantine/recover/failover/fallback:*/relay:* 等 40+ 调用点）在写入事件日志的同时经 `busPublish` 推送给 SSE 订阅者；另有**流量信号 `notifyActivity`**（每请求发生、刻意不入事件日志，防高频流量把 500 条日志上限中的结构性事件挤掉）。
 
 - `GET /api/stream`（`text/event-stream`）两类消息：`{"kind":"event","ev"}` 与 `{"kind":"activity","keyId"|"relayId"}`；25s 心跳注释帧防僵死，连接上限 8，断开即清理；设 `localToken` 时经 `?token=` 鉴权（EventSource 无法带 header）。
-- 前端订阅后：**使用中光效秒级点亮**（不等刷新周期）、事件日志即时出新条目 + 750ms 防抖整页刷新；拉取轮询保留为兜底对账——**推送负责新鲜度，时钟降级为对账**。
+- 前端订阅后：**使用中光效秒级点亮**（不等刷新周期）、事件日志即时出新条目；结构性事件（bind/cooldown/quarantine/recover/relay-*/fallback-*/config）750ms 防抖整页对账，**纯流量事件**（`cache-hit`/空回复——高频且不改变调度状态）只点亮光效不触发整页刷新；拉取轮询保留为兜底对账——**推送负责新鲜度，时钟降级为对账**。
 - 15 分钟 `/usage` 轮询仍是对账器（窗口滚动数据与调度输入的事实源），不因推送而移除。
 
 ## 同池检测
