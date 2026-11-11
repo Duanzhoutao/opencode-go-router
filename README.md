@@ -17,7 +17,7 @@ OpenCode Go 订阅的每个 Key 有 **5 小时滚动 / 每周 / 每月** 三重�
 
 ## 特性
 
-- **会话粘性（`x-session-id`）**：同一会话永远走同一 Key，模型上下文缓存不因轮换失效；跨会话自动分配到不同 Key。
+- **会话粘性（`x-session-id`）**：开启粘性且绑定 Key 可用时，同一会话复用该 Key；绑定 Key 不可用时自动迁移。不同会话可能分配到同一 Key，缓存是否命中由上游决定。
 - **限额感知调度**：每 15 分钟轮询 `/usage` 三窗口用量（5h 滚动 / 周 / 月，含 `resetsAt`）；会话流量按**月到期优先**（月窗到期未用完的额度随续费作废，先花马上到期的），无会话流量按**最轻松优先**（路由到余量最大的 Key）。
 - **透明 failover**：上游 429 实时冷却对应窗口（`limitName` 按关键词归一，5h 窗口上游实际叫 "5 hour"）后缓冲首字节自动换下一个可用 Key（failoverChain 兜底），对客户端无感知。
 - **备用通道（通用 OpenAI 协议兜底）**：全部 Go Key 不可用时自动切到任意 OpenAI 兼容上游（默认 DeepSeek 官方，火山方舟等均可），请求模型自动改写、思考强度默认拉满（`reasoning_effort=max`，各厂取值不同，可改或留空交上游默认）；任一 Go Key 恢复立刻切回。DeepSeek 官方可选**余额差值自动计费**（人民币快照差值 + 15 分钟采样 + 关网关补结算），其他端点不计费模式。
@@ -57,7 +57,7 @@ OpenCode Go 订阅的每个 Key 有 **5 小时滚动 / 每周 / 每月** 三重�
 要求：Node.js ≥ 18（作者环境 24）。
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/Duanzhoutao/opencode-go-router.git
 cd opencode-go-router
 node go-gateway.cjs
 ```
@@ -118,7 +118,7 @@ ZCode 配置示例：
 要点：
 
 - **`baseURL` 必须以 `/v1` 结尾**——网关在这个后缀上暴露 OpenAI 协议面（`/v1/chat/completions`、`/v1/models`）。
-- **`apiKey` 是占位符**。网关不关心这里填什么（填任何非空字符串即可），真实的 Go Key 由网关内部持有并按调度使用。
+- **`apiKey` 取决于本地鉴权配置**：未设置 localToken 时，可填任意非空占位符；设置后，客户端 `apiKey` 必须填写与 localToken 相同的值。真实 Go Key 由网关内部管理。
 - **不需要在客户端里配模型列表**：网关把上游的 `/v1/models` 原样透传，客户端启动探测自动发现模型与思考档位。
 - **保留直连逃生门**：建议把原来的直连 provider 保留一份并置为 disabled，出问题时改回 baseURL 即可秒切。
 - **MCP 不用动**：网关只代理 LLM 对话 API，MCP server 连接不经网关，详见 [docs/client-integration.md](docs/client-integration.md)。
