@@ -1,5 +1,5 @@
 # OpenCode Go Router
-
+111
 **多 Key 本地路由网关**：一个本机 Node 进程持有多个 OpenCode Go Key，对 OpenAI 兼容的 Agent 客户端（ZCode / OpenCode / Claude Code 生态）呈现为一个普通 `127.0.0.1` provider——按会话粘性 + 限额调度自动选 Key，Key 用尽自动切换/隔离，全部不可用时自动走备用通道；也支持把第三方**中转站**（单模型、按额度计费）按模型优先接入，失败自动降级回 Go 池。零依赖、零改造接入。
 
 > ⚠️ 非官方项目，与 opencode.ai 无任何关联。「OpenCode Go」是其付费订阅产品，本仓库只做本地 Key 配额管理。
